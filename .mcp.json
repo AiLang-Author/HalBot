@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "halbot": {
+      "type": "stdio",
+      "command": "halbot-mcp/run-mcp.sh"
+    }
+  }
+}

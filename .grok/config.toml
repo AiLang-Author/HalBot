@@ -1,0 +1,8 @@
+# HalBot driver. Grok loads this when the repo folder is trusted.
+# To call the bot from other projects, register the absolute path of
+# halbot-mcp/run-mcp.sh in your user config. See the README.
+[mcp_servers.halbot]
+command = "halbot-mcp/run-mcp.sh"
+args = []
+enabled = true
+tool_timeout_sec = 86400

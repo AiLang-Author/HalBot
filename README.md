@@ -65,12 +65,30 @@ Provider keys entered in the page are written to guest files such as:
 
 These keys are written on the guest and are not stored in this repository.
 
+## Drive the bot from an assistant
+
+`halbot-mcp/server.py` is a local MCP server. `halbot_task` sends one task to the guest and returns the reply. `halbot_health` checks the page. The server talks only to the page (default `http://127.0.0.1:8090`). The page adds the serve token. This server never reads it.
+
+The bot's shell runs in the guest. That includes sudo and rm while the guest opt-in file exists. Start the page before calling the tool. A call blocks until the turn ends. The guest handles one turn at a time, so a task must not call this same HTTP port.
+
+Opening this repo loads `.mcp.json` for Claude, and `.grok/config.toml` for Grok once the folder is trusted. Both run `halbot-mcp/run-mcp.sh`. To use the bot from other projects, register the absolute path once:
+
+```bash
+grok mcp add halbot -- /absolute/path/to/HalBot/halbot-mcp/run-mcp.sh
+claude mcp add --scope user halbot -- /absolute/path/to/HalBot/halbot-mcp/run-mcp.sh
+```
+
+`HALBOT_PAGE` overrides the page URL. `HALBOT_MCP_TIMEOUT` is a request timeout in seconds. Leave it unset and the call waits until the turn finishes. A new server process starts a new chat. Later calls from that process continue the session unless `new_session` is true.
+
+Grok's own MCP tool timeout is separate from the guest. The default is 6000 seconds. Raise `tool_timeout_sec` under `[mcp_servers.halbot]` for a longer guest task.
+
 ## Repository layout
 
 - `HalCode9000.ailang` — main agent runtime
 - `cc_tools/` — tool implementations and utility code
 - `IPCDispatch.ailang` — IPC dispatch layer
 - `halbot-web/` — chat page and local proxy layer
+- `halbot-mcp/` — MCP server that sends one task to the guest and returns the reply
 - `vm/` — guest VM provisioning and lifecycle scripts
 - `docs/` — design and build notes
 - `scripts/` — helper scripts, including desktop install helpers
@@ -105,6 +123,23 @@ On the guest, `install.sh` creates `~/.halcode/allow_sudo`.
 While that file exists, Bash allows a restricted set of privileged operations, including `sudo`, `rm`, `mv`, `dd`, `kill`, `crontab`, pipes into a shell, and redirects onto system paths.
 
 This is intentional for the guest automation workflow, but it is a security boundary. Treat it as a privileged execution model rather than a general-purpose sandbox.
+
+## Drive the bot from an assistant
+
+`halbot-mcp/server.py` is a local MCP server. `halbot_task` sends one task to the guest and returns the reply. `halbot_health` checks the page. The server talks only to the page (default `http://127.0.0.1:8090`). The page adds the serve token. This server never reads it.
+
+The bot's shell, including sudo and rm when the guest opt-in file exists, runs in the guest. Start the page before calling the tool. A call blocks until the turn ends. The guest handles one turn at a time, so a task must not call this same HTTP port.
+
+Opening this repo loads `.mcp.json` for Claude, and `.grok/config.toml` for Grok once the folder is trusted. Both run `halbot-mcp/run-mcp.sh`. To use the bot from other projects, register the absolute path once:
+
+```bash
+grok mcp add halbot -- /absolute/path/to/HalBot/halbot-mcp/run-mcp.sh
+claude mcp add --scope user halbot -- /absolute/path/to/HalBot/halbot-mcp/run-mcp.sh
+```
+
+`HALBOT_PAGE` overrides the page URL. `HALBOT_MCP_TIMEOUT` is a request timeout in seconds. Leave it unset and the call waits until the turn finishes. A new server process starts a new chat. Later calls from that process continue the session unless `new_session` is true.
+
+Grok's own MCP tool timeout is separate from the guest. The default is 6000 seconds. Raise `tool_timeout_sec` under `[mcp_servers.halbot]` for a longer guest task.
 
 ## Build
 
