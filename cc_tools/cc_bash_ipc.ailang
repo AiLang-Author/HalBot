@@ -831,9 +831,10 @@ Function.CCBash_IsRedirectToSystemPath {
     }
 }
 
-// 1 when this machine has opted in to sudo. The flag is a file, so a desk
-// without ~/.halcode/allow_sudo stays blocked. rm and the other blocks
-// still run after this check, so `sudo rm` stays forbidden.
+// 1 when this machine has opted in. The flag is a file, so a desk without
+// ~/.halcode/allow_sudo stays blocked. On the bot's own machine the same
+// file also allows rm, mv, dd, kill, crontab, pipes to a shell, and
+// redirects onto system paths.
 Function.CCBash_SudoAllowed {
     Output: Integer
     Body: {
@@ -1062,39 +1063,40 @@ Function.CCBash_HandleRequest {
                 CCBash_SendError(client_fd, id, "Blocked: `find` with a filesystem root (/ /mnt /proc /sys) causes permanent hangs on WSL2. Scope find to a specific directory under /home or the project path.")
                 ReturnValue(0)
             }
-            IfCondition EqualTo(CCBash_ContainsSudo(cmd), 1) ThenBlock: {
-                IfCondition EqualTo(CCBash_SudoAllowed(), 0) ThenBlock: {
+            own = CCBash_SudoAllowed()
+            IfCondition EqualTo(own, 0) ThenBlock: {
+                IfCondition EqualTo(CCBash_ContainsSudo(cmd), 1) ThenBlock: {
                     CCBash_SendError(client_fd, id, "Blocked: `sudo` is strictly forbidden. Do not attempt to escalate privileges.")
                     ReturnValue(0)
                 }
-            }
-            IfCondition EqualTo(CCBash_ContainsRm(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: `rm` is not permitted. File deletion is the user's responsibility.")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_ContainsMv(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: `mv` is not permitted. File management is the user's responsibility.")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_ContainsDd(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: `dd` can overwrite raw devices. File operations are the user's responsibility.")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_ContainsKillCmd(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: `kill`/`killall`/`pkill` are not permitted. Process management is the user's responsibility.")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_ContainsCrontab(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: `crontab` installs persistent scheduled tasks and is not permitted.")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_ContainsPipeToShell(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: piping to `sh` or `bash` is not permitted (supply-chain risk).")
-                ReturnValue(0)
-            }
-            IfCondition EqualTo(CCBash_IsRedirectToSystemPath(cmd), 1) ThenBlock: {
-                CCBash_SendError(client_fd, id, "Blocked: shell output redirect (> or >>) targeting a system path. Writing to OS-critical directories is not allowed.")
-                ReturnValue(0)
+                IfCondition EqualTo(CCBash_ContainsRm(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: `rm` is not permitted. File deletion is the user's responsibility.")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_ContainsMv(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: `mv` is not permitted. File management is the user's responsibility.")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_ContainsDd(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: `dd` can overwrite raw devices. File operations are the user's responsibility.")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_ContainsKillCmd(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: `kill`/`killall`/`pkill` are not permitted. Process management is the user's responsibility.")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_ContainsCrontab(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: `crontab` installs persistent scheduled tasks and is not permitted.")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_ContainsPipeToShell(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: piping to `sh` or `bash` is not permitted (supply-chain risk).")
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(CCBash_IsRedirectToSystemPath(cmd), 1) ThenBlock: {
+                    CCBash_SendError(client_fd, id, "Blocked: shell output redirect (> or >>) targeting a system path. Writing to OS-critical directories is not allowed.")
+                    ReturnValue(0)
+                }
             }
             // Schema type is int, so the model sends a JSON number.
             // GetString on a number is 0, which used to fall through to the
