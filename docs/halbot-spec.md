@@ -278,7 +278,7 @@ Approval flows (order of preference):
   then workers inherit the VM's permissions and the WSL2 RULES command
   blocklist applies on WSL hosts.
 - Secrets live in env/`keys.env`, never in history or parked results.
-- Per-session token budget and tool-call caps mirror the existing WSL2 chain limit.
+- There is no tool-chain cap. A failed model turn still stops the loop.
 
 ---
 

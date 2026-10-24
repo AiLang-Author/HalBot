@@ -1421,7 +1421,7 @@ Function.CC_StatusReport {
         s = StringConcat(s, NumberToString(UILayout.ctx_pct))
         s = StringConcat(s, "\ntool_chains: ")
         s = StringConcat(s, NumberToString(chains))
-        s = StringConcat(s, "\ntool_chain_cap: 25")
+        s = StringConcat(s, "\ntool_chain_cap: none")
         proj = "(none)"
         IfCondition NotEqual(UILayout.proj_slug, 0) ThenBlock: {
             IfCondition GreaterThan(StringLength(UILayout.proj_slug), 0) ThenBlock: {
@@ -1528,50 +1528,6 @@ Function.CC_RunTurn {
         WhileLoop EqualTo(keep_going, 1) {
             keep_going = 0
 
-            IfCondition And(GreaterEqual(chain_count, 25), EqualTo(CCRunState.auto_approve, 0)) ThenBlock: {
-                UI.ChatTag("?", "Agent has chained 25 tools. Continue? [Y/n/a (always) or type to steer]", 3) // 3 = ORANGE
-                ans = UI.ReadLine()
-                ans_len = StringLength(ans)
-                steering = 0
-                
-                IfCondition EqualTo(ans_len, 0) ThenBlock: {
-                    chain_count = 0
-                } ElseBlock: {
-                    first = GetByte(ans, 0)
-                    IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 110), EqualTo(first, 78))) ThenBlock: {
-                        UI.ChatTag("✗", "Execution paused.", 1) // 1 = RED
-                        BreakLoop
-                    } ElseBlock: {
-                        IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 97), EqualTo(first, 65))) ThenBlock: {
-                            CCRunState.auto_approve = 1
-                            chain_count = 0
-                        } ElseBlock: {
-                            IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 121), EqualTo(first, 89))) ThenBlock: {
-                                chain_count = 0
-                            } ElseBlock: {
-                                steering = 1
-                            }
-                        }
-                    }
-                }
-                IfCondition EqualTo(steering, 1) ThenBlock: {
-                    dummy = JSON.NewObject()
-                    dummy_role = CC_StrDup("assistant")
-                    dummy_text = CC_StrDup("[System: Awaiting user steering]")
-                    JSON.SetString(dummy, "role", dummy_role)
-                    JSON.SetString(dummy, "content", dummy_text)
-                    IfCondition NotEqual(SelectedProvider.reasoning_effort, 0) ThenBlock: {
-                        dummy_rc = CC_StrDup("")
-                        JSON.SetString(dummy, "reasoning_content", dummy_rc)
-                    }
-                    History.AppendRaw(dummy)
-                    
-                    History.AppendUser(ans)
-                    keep_going = 1
-                    chain_count = 0
-                    ContinueLoop
-                }
-            }
             chain_count = Add(chain_count, 1)
 
             // --- Retry Loop for API calls ---
@@ -3744,15 +3700,10 @@ Function.CC_ChatLoop {
                     UI.ChatPrintln("Logged out and configs cleared. Please restart HalCode9000.")
                     CCRunState.running = 0
                 }
-                // /auto — toggle autonomous mode (no 25-tool confirmation pause)
+                // /auto — tool chains are not capped in this tree.
                 IfCondition EqualTo(StringCompare(line, "/auto"), 0) ThenBlock: {
-                    IfCondition EqualTo(CCRunState.auto_approve, 0) ThenBlock: {
-                        CCRunState.auto_approve = 1
-                        UI.ChatTag("✓", "Autonomous mode ON — tool chains run without pause.", 2)
-                    } ElseBlock: {
-                        CCRunState.auto_approve = 0
-                        UI.ChatTag("✓", "Autonomous mode OFF — will pause after 25 tool calls.", 3)
-                    }
+                    CCRunState.auto_approve = 1
+                    UI.ChatTag("✓", "Tool chains are not capped.", 2)
                 }
                 // /tools — toggle tool call display (compact summary vs expanded per-call)
                 IfCondition EqualTo(StringCompare(line, "/tools"), 0) ThenBlock: {
@@ -5064,43 +5015,41 @@ Function.CC_RunAgentMode {
         // Agentic loop: keep calling CC_RunTurn as long as the model requests
         // tools. After each turn, if the last history entry is a "user" role
         // block (i.e. tool results were just appended), the model needs another
-        // round. Cap at 25 iterations to match the system-prompt rule.
+        // round. There is no tool-chain cap. A failed turn still stops.
         agent_turn = 0
-        agent_max_turns = 25
         agent_keep_going = 1
-        WhileLoop And(EqualTo(agent_keep_going, 1), LessThan(agent_turn, agent_max_turns)) {
+        WhileLoop EqualTo(agent_keep_going, 1) {
             agent_keep_going = 0
             CC_AgentLog(StringConcat("[worker] CC_RunTurn turn=", NumberToString(agent_turn)))
             turn_ok = CC_RunTurn()
             CC_AgentLog(StringConcat("[worker] CC_RunTurn complete ok=", NumberToString(turn_ok)))
             IfCondition EqualTo(turn_ok, 0) ThenBlock: {
-                CC_AgentLog("[worker] turn failed — not looping 25 empty retries")
+                CC_AgentLog("[worker] turn failed — stopping")
                 agent_keep_going = 0
             }
 
             // Tool results are appended as role:"user" messages by
             // Backend.AppendToolResultsToHistory. If the last history entry
             // has role "user", the model made tool calls this round and needs
-            // another API call to process the results.
-            _am_msgs = History.GetMessagesArray()
-            _am_cnt = History.Count()
-            IfCondition GreaterThan(_am_cnt, 0) ThenBlock: {
-                _am_last_tag = JSON.ArrayGet(_am_msgs, Subtract(_am_cnt, 1))
-                _am_last_msg = JSON.AsObject(_am_last_tag)
-                IfCondition NotEqual(_am_last_msg, 0) ThenBlock: {
-                    _am_last_role = JSON.GetString(_am_last_msg, "role")
-                    IfCondition NotEqual(_am_last_role, 0) ThenBlock: {
-                        IfCondition EqualTo(StringCompare(_am_last_role, "user"), 0) ThenBlock: {
-                            agent_keep_going = 1
+            // another API call to process the results. A failed turn does not
+            // continue, even if that last entry is still a user message.
+            IfCondition NotEqual(turn_ok, 0) ThenBlock: {
+                _am_msgs = History.GetMessagesArray()
+                _am_cnt = History.Count()
+                IfCondition GreaterThan(_am_cnt, 0) ThenBlock: {
+                    _am_last_tag = JSON.ArrayGet(_am_msgs, Subtract(_am_cnt, 1))
+                    _am_last_msg = JSON.AsObject(_am_last_tag)
+                    IfCondition NotEqual(_am_last_msg, 0) ThenBlock: {
+                        _am_last_role = JSON.GetString(_am_last_msg, "role")
+                        IfCondition NotEqual(_am_last_role, 0) ThenBlock: {
+                            IfCondition EqualTo(StringCompare(_am_last_role, "user"), 0) ThenBlock: {
+                                agent_keep_going = 1
+                            }
                         }
                     }
                 }
             }
             agent_turn = Add(agent_turn, 1)
-        }
-
-        IfCondition GreaterEqual(agent_turn, agent_max_turns) ThenBlock: {
-            CC_AgentLog("[worker] WARNING: hit max turn cap (25) — stopping")
         }
 
         CC_AgentLog("[worker] CCFan shutdown")
