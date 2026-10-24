@@ -32,8 +32,8 @@ Set `AILANG_ROOT` to your AILang tree if it is not `~/Ailang-Self-Hosting-`.
 ```bash
 git clone https://github.com/AiLang-Author/HalCodeGTK.git
 cd HalCodeGTK
-chmod +x install.sh
-./install.sh
+chmod +x scripts/install-desk.sh
+./scripts/install-desk.sh
 ```
 
 That builds the agent, GTK host, and desk; registers **HalCode9000** in the
@@ -41,8 +41,8 @@ Applications menu; links `~/.local/bin/halcode` and `~/.local/bin/lastlog`;
 and runs `setup.sh` for API keys / pgmem.
 
 ```bash
-./install.sh --skip-keys --skip-postgres --skip-olympus
-./install.sh --no-build          # menu entry only
+./scripts/install-desk.sh --skip-keys --skip-postgres --skip-olympus
+./scripts/install-desk.sh --no-build          # menu entry only
 ./scripts/install_desktop.sh --uninstall
 ```
 

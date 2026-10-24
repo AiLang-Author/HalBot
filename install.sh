@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# HalCodeGTK one-shot install: build the GTK desk, menu entry, keys.
-# Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+# HalBot install. All code in this repo is MIT.
+# Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering.
 #
-# Usage:
+# From a fresh clone:
 #   ./install.sh
-#   ./install.sh --skip-keys --skip-postgres --skip-olympus
-#   ./install.sh --no-build          # desktop + keys only
-#   ./install.sh --no-desktop
+#
+# Options:
+#   --no-build   skip ./build.sh (binaries already present)
+#   --no-vm      build only, do not download or boot the guest
+#   --no-guest   boot the guest, do not apt-install inside it
 set -euo pipefail
 
-SKIP_KEYS=0
-SKIP_POSTGRES=0
-SKIP_OLYMPUS=0
-NO_BUILD=0
-NO_DESKTOP=0
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VM="$ROOT/vm"
+BUILD=1
+DO_VM=1
+DO_GUEST=1
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-keys) SKIP_KEYS=1; shift ;;
-        --skip-postgres) SKIP_POSTGRES=1; shift ;;
-        --skip-olympus) SKIP_OLYMPUS=1; shift ;;
-        --no-build) NO_BUILD=1; shift ;;
-        --no-desktop) NO_DESKTOP=1; shift ;;
+        --no-build) BUILD=0; shift ;;
+        --no-vm) DO_VM=0; DO_GUEST=0; shift ;;
+        --no-guest) DO_GUEST=0; shift ;;
         -h|--help)
             sed -n '2,12p' "$0" | sed 's/^# \?//'
             exit 0
@@ -29,67 +30,127 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
-export HALCODE_ROOT="$ROOT"
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-log()  { printf '==> %s\n' "$*"; }
-info() { printf '    %s\n' "$*"; }
-die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+if [[ "$BUILD" -eq 1 ]]; then
+    if ! command -v ailang.x >/dev/null 2>&1; then
+        die "ailang.x is not on PATH. Clone https://github.com/AiLang-Author/Ailang-Self-Hosting- and run ./install_compiler.sh, then re-run ./install.sh"
+    fi
+    log "Building agent and tools"
+    (cd "$ROOT" && ./build.sh)
+fi
 
-if [[ -z "${AILANG_ROOT:-}" ]]; then
-    if [[ -d "$HOME/Ailang-Self-Hosting-" ]]; then
-        AILANG_ROOT="$HOME/Ailang-Self-Hosting-"
-    elif command -v ailang.x >/dev/null 2>&1; then
-        AILANG_ROOT="$(cd "$(dirname "$(readlink -f "$(command -v ailang.x)")")" && pwd)"
+if [[ "$DO_VM" -eq 0 ]]; then
+    log "Build finished. Guest was not started."
+    exit 0
+fi
+
+need=()
+command -v qemu-system-x86_64 >/dev/null 2>&1 || need+=(qemu-system-x86)
+command -v qemu-img >/dev/null 2>&1 || need+=(qemu-utils)
+command -v mkfs.vfat >/dev/null 2>&1 || need+=(dosfstools)
+command -v mcopy >/dev/null 2>&1 || need+=(mtools)
+command -v ssh >/dev/null 2>&1 || need+=(openssh-client)
+command -v ssh-keygen >/dev/null 2>&1 || need+=(openssh-client)
+command -v python3 >/dev/null 2>&1 || need+=(python3)
+command -v curl >/dev/null 2>&1 || need+=(curl)
+command -v rsync >/dev/null 2>&1 || need+=(rsync)
+if [[ ${#need[@]} -gt 0 ]]; then
+    # de-dupe
+    mapfile -t need < <(printf '%s\n' "${need[@]}" | awk '!seen[$0]++')
+    if command -v apt-get >/dev/null 2>&1; then
+        log "Installing host packages: ${need[*]}"
+        sudo apt-get update
+        sudo apt-get install -y "${need[@]}"
     else
-        AILANG_ROOT=""
+        die "missing tools. Install: ${need[*]}"
     fi
 fi
-export AILANG_ROOT
 
-if [[ "$NO_BUILD" -eq 0 ]]; then
-    command -v cc >/dev/null 2>&1 || die "cc not found (install gcc or clang)"
-    command -v pkg-config >/dev/null 2>&1 || die "pkg-config not found"
-    pkg-config --exists gtk+-3.0 cairo || die "GTK 3 + cairo not found (Debian: sudo apt install libgtk-3-dev libcairo2-dev pkg-config)"
-    command -v ailang.x >/dev/null 2>&1 || die "ailang.x not on PATH. Clone https://github.com/AiLang-Author/Ailang-Self-Hosting- and run its install_compiler.sh"
+IMG="$VM/debian-13-genericcloud-amd64.qcow2"
+URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+if [[ ! -f "$IMG" ]]; then
+    log "Downloading Debian 13 genericcloud"
+    curl -fL --retry 3 -o "$IMG.partial" "$URL"
+    mv "$IMG.partial" "$IMG"
+fi
+log "Checking Debian image checksum"
+(
+    cd "$VM"
+    sha512sum -c SHA512SUMS --ignore-missing --status
+) || die "SHA512 mismatch for $IMG. Delete it and re-run."
 
-    log "Building agent + tools"
-    ./build.sh
+mkdir -p "$VM/keys"
+chmod 700 "$VM/keys"
+if [[ ! -f "$VM/keys/id_ed25519" ]]; then
+    log "Creating an SSH key for this guest"
+    ssh-keygen -t ed25519 -f "$VM/keys/id_ed25519" -N "" -C "halbot"
+fi
+chmod 600 "$VM/keys/id_ed25519"
 
-    log "Building GTK host + desk (AILANG_ROOT=$AILANG_ROOT)"
-    make -C shell AILANG_ROOT="$AILANG_ROOT"
-    [[ -x "$ROOT/shell/halcode_desk.x" ]] || die "desk build failed"
-    [[ -x "$ROOT/shell/halcode_shell_gtk" ]] || die "GTK host build failed"
-    [[ -x "$ROOT/HalCode9000.x" ]] || die "agent binary missing"
+log "Building cloud-init seed"
+"$VM/make-seed.sh"
+
+if [[ ! -f "$VM/disk.qcow2" ]]; then
+    log "Creating a 16G guest disk"
+    (
+        cd "$VM"
+        qemu-img create -f qcow2 -F qcow2 -b debian-13-genericcloud-amd64.qcow2 disk.qcow2 16G
+    )
 fi
 
-if [[ "$NO_DESKTOP" -eq 0 ]]; then
-    log "Applications menu + ~/.local/bin/halcode"
-    chmod +x "$ROOT/scripts/launch_halcode.sh" "$ROOT/scripts/install_desktop.sh"
-    "$ROOT/scripts/install_desktop.sh"
+port_busy() { ss -ltn | grep -q ":$1 "; }
+
+if [[ -f "$VM/halbot.pid" ]] && kill -0 "$(cat "$VM/halbot.pid")" 2>/dev/null; then
+    log "Guest already running, pid $(cat "$VM/halbot.pid")"
+elif port_busy 2222 || port_busy 8080; then
+    die "127.0.0.1:2222 or :8080 is already in use. Stop the other QEMU before starting this guest."
+else
+    log "Starting the guest"
+    "$VM/run.sh"
 fi
 
-log "Keys / pgmem / Olympus (same as TUI)"
-SETUP_ARGS=()
-[[ "$SKIP_KEYS" -eq 1 ]] && SETUP_ARGS+=(--skip-keys)
-[[ "$SKIP_POSTGRES" -eq 1 ]] && SETUP_ARGS+=(--skip-postgres)
-[[ "$SKIP_OLYMPUS" -eq 1 ]] && SETUP_ARGS+=(--skip-olympus)
-"$ROOT/setup.sh" "${SETUP_ARGS[@]}"
+SSH=(ssh
+    -i "$VM/keys/id_ed25519"
+    -p 2222
+    -o UserKnownHostsFile="$VM/keys/known_hosts"
+    -o StrictHostKeyChecking=accept-new
+    -o BatchMode=yes
+    -o ConnectTimeout=5
+    halbot@127.0.0.1
+)
 
-if [[ ! -f "$HOME/.halcode/system_prompt.txt" && -f "$ROOT/config/system_prompt.txt" ]]; then
-    mkdir -p "$HOME/.halcode"
-    chmod 700 "$HOME/.halcode"
-    cp "$ROOT/config/system_prompt.txt" "$HOME/.halcode/system_prompt.txt"
-    if [[ ! -f "$HOME/.halcode/halcode.json" ]]; then
-        printf '%s\n' '{ "max_tokens": 16384, "system_prompt_file": "system_prompt.txt" }' \
-            > "$HOME/.halcode/halcode.json"
+if [[ "$DO_GUEST" -eq 0 ]]; then
+    log "Guest is up. SSH: ssh -i $VM/keys/id_ed25519 -p 2222 halbot@127.0.0.1"
+    exit 0
+fi
+
+log "Waiting for SSH"
+ready=0
+for _ in $(seq 1 90); do
+    if "${SSH[@]}" true >/dev/null 2>&1; then
+        ready=1
+        break
     fi
-    info "wrote ~/.halcode/system_prompt.txt"
-fi
+    sleep 2
+done
+[[ "$ready" -eq 1 ]] || die "guest SSH did not come up on port 2222"
+
+log "Copying the tree to the guest"
+rsync -a \
+    --exclude '.git' \
+    --exclude 'vm' \
+    --exclude '.claude' \
+    --exclude '__pycache__' \
+    -e "ssh -i $VM/keys/id_ed25519 -p 2222 -o UserKnownHostsFile=$VM/keys/known_hosts -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
+    "$ROOT/" halbot@127.0.0.1:HalBot/
+
+log "Installing guest packages and starting the bot"
+"${SSH[@]}" 'bash -s' < "$VM/guest-setup.sh"
 
 log "Done"
-info "Launch:  halcode"
-info "Or:      $ROOT/scripts/launch_halcode.sh"
-info "Prompt:  ~/.halcode/system_prompt.txt"
-info "Rebuild: make -C $ROOT && halcode"
+echo "    SSH:   ssh -i $VM/keys/id_ed25519 -p 2222 halbot@127.0.0.1"
+echo "    Page:  $ROOT/halbot-web/run-page.sh"
+echo "    Open:  http://127.0.0.1:8090/"
+echo "    Keys go in the page. They are written on the guest, not in this repo."

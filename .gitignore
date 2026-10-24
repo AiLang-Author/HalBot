@@ -1,49 +1,12 @@
-# ── Build products ───────────────────────────────────────────────────────────
-*.x
-
-# ── VM runtime (disk contains the guest, including provider keys) ───────────
+# All source in this repository is MIT and is tracked.
+# These paths are created by install.sh. They are not code.
+# vm/keys holds the SSH private key. Disk images can hold provider keys.
+vm/keys/
 vm/*.qcow2
 vm/*.img
 vm/serial.log
 vm/halbot.pid
 vm/qmp.sock
-vm/keys
-
-# ── Scratch / dev notes ──────────────────────────────────────────────────────
-deepseek_agent_docs.md
-GEMINI_PROMPT_wire_backend.txt
-backends/GEMINI_PROMPT_openai_backend.txt
-hal_tool_test.txt
-"deepseek anthropic connector info.txt"
-deepseek\ anthropic\ connector\ info.txt
-model\ rating\ template.txt
-psuedocodemodelselector.txt
-sql.sql
-stuff.php
-paperclip_optimizer.py
-pluto-*
-workspace.code-workspace
-
-# ── Build / object files ─────────────────────────────────────────────────────
-*.o
-*.a
-*.bak
-*.zip
 __pycache__/
 *.pyc
-nohup.out
-
-# ── OS junk ──────────────────────────────────────────────────────────────────
-.DS_Store
-Thumbs.db
 .claude/
-
-# ── Local GTK builds (compile on install) ────────────────────────────────────
-shell/halcode_shell_gtk
-shell/write_hello_frame
-
-# ── Dev screenshots / scratch ────────────────────────────────────────────────
-Screenshot*.png
-failed text boundry .png
-/tmp/
-debug.log

@@ -10,7 +10,7 @@ users:
     shell: /bin/bash
     lock_passwd: true
     ssh_authorized_keys:
-      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBv+c1cV1O3PyZMeAE/cOFVcT+KIVRjbbvOlLjn/FpfE halbot-vm
+      - SSH_PUBLIC_KEY
 growpart:
   mode: auto
   devices: ['/']
