@@ -292,7 +292,7 @@ Function.Agent_HandleRequest {
                     worker_spec = "deepseek"
                 }
                 Agent_LogMsg(log_path, StringConcat("[daemon] worker_spec=", worker_spec))
-                cmd_prefix = StringConcat("timeout 300 ./HalCode9000.x --agent ", worker_spec)
+                cmd_prefix = StringConcat("./HalCode9000.x --agent ", worker_spec)
                 cmd_prefix = StringConcat(cmd_prefix, " < ")
 
                 c_data = ""

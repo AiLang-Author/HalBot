@@ -193,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
             self._key_save()
             return
         if path == "/v1/chat" or (path.startswith("/v1/sessions/") and path.endswith("/messages")):
-            self._proxy(timeout=360)
+            self._proxy(timeout=None)
             return
         self.send_error(404)
 

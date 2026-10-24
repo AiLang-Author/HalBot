@@ -5923,7 +5923,7 @@ Function.CC_Serve_RunAgent {
 
         envp = CC_BuildInheritedEnvp()
 
-        cmd = "timeout 300 ./HalCode9000.x --agent "
+        cmd = "./HalCode9000.x --agent "
         cmd = StringConcat(cmd, spec)
         cmd = StringConcat(cmd, " < ")
         cmd = StringConcat(cmd, in_path)

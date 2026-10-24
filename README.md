@@ -18,7 +18,7 @@ Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
 
 `cc_tools/cc_bash_ipc.ailang` allows `sudo` only when `~/.halcode/allow_sudo` exists on that machine. Create that empty file on the guest. Do not create it on a personal desk.
 
-The agent loop has no tool-chain cap. It keeps calling tools until the model stops or a turn fails. The personal HalCode desk is a separate tree and still has its own pause.
+The agent loop has no tool-chain cap and no 5-minute wall clock. It keeps calling tools until the model stops or a turn fails. The personal HalCode desk is a separate tree and still has its own pause.
 
 `rm`, `mv`, `dd`, `kill` / `killall` / `pkill`, `crontab`, pipes into `sh` or `bash`, and redirects onto system paths stay blocked. `sudo rm` still hits the `rm` check.
 
