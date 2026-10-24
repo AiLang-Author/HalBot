@@ -1,0 +1,3821 @@
+// cc_relmem_ipc.ailang — Claude Code Relmem tool, IPC service.
+//
+// Symbolic memory: walks a project, parses each file into a graph of
+// symbols + edges, persists the result as JSON, and answers queries
+// over it without re-reading source. Successor to tools/relmem.py;
+// same on-disk format (~/.claude/relmem/index.json), broader parser
+// set, integrated into the cc_tools IPC ecosystem.
+//
+// Speaks the standard cc_tools envelope:
+//
+//   Request:  {"method":"call",   "id":"<tool_use_id>", "args":{"op":"where", "symbol":"Win_BlitAll"}}
+//   Request:  {"method":"schema"}
+//   Response: {"method":"result", "id":"<tool_use_id>", "ok":true,  "content":"..."}
+//   Response: {"method":"schema_response", "schema": {...}}
+//   Error:    {"method":"result", "id":"<tool_use_id>", "ok":false, "error":"..."}
+//
+// Schema is op-dispatched: a single required `op` field selects one of
+// status / summary / query / where / symbols / focus / callers / calls
+// / index / forget / drop. Per-op fields are all optional at schema
+// validation time; each handler enforces what it actually needs.
+//
+// Build: ./ailang.x Applications/ClaudeCode/cc_tools/cc_relmem_ipc.ailang cc_relmem_ipc.x
+// Run:   ./cc_relmem_ipc.x   (binds /tmp/ailang_cctools/Relmem.sock)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+LibraryImport.Arrays
+LibraryImport.Regex_Thompson
+LibraryImport.PostgreSQL_Complete
+
+
+// =============================================================================
+// SYSCALL CONSTANTS  (linux x86-64)
+// =============================================================================
+FixedPool.CCRelSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_STAT":      Initialize=4
+    "SYS_FSTAT":     Initialize=5
+    "SYS_LSTAT":     Initialize=6
+    "SYS_POLL":      Initialize=7
+    "SYS_GETDENTS":  Initialize=78
+    "SYS_RENAME":    Initialize=82
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_EXIT":      Initialize=60
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_VFORK":     Initialize=58
+    "SYS_EXECVE":    Initialize=59
+    "SYS_WAIT4":     Initialize=61
+
+    "O_RDONLY":      Initialize=0
+    "O_WRONLY":      Initialize=1
+    "O_CREAT":       Initialize=64
+    "O_TRUNC":       Initialize=512
+    "O_DIR":         Initialize=65536
+
+    "S_IFMT":        Initialize=61440
+    "S_IFDIR":       Initialize=16384
+    "S_IFREG":       Initialize=32768
+
+    "MODE_DIR":      Initialize=493
+    "MODE_FILE":     Initialize=420
+}
+
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.CCRelConst {
+    "PARSER_VERSION": Initialize=3
+
+    "SOCK_PATH":      Initialize=0, CanChange=True
+    "SOCK_DIR":       Initialize=0, CanChange=True
+    "BACKLOG":        Initialize=8
+    "MAX_OUTPUT":    Initialize=50000
+
+    "PATH_MAX":       Initialize=4096
+    "DENTS_BUF":      Initialize=8192
+    "READ_CHUNK":     Initialize=65536
+    "ENV_BUF":        Initialize=16384
+    "STATBUF_SIZE":   Initialize=144
+
+    // stat(2) field offsets we use
+    "ST_MODE_OFF":    Initialize=24
+    "ST_SIZE_OFF":    Initialize=48
+    "ST_MTIME_OFF":   Initialize=88
+
+    // linux_dirent64 layout on this build (WSL/Pop!_OS x86-64):
+    //   ino(8) + off(8) + reclen(2) + name (no d_type byte)
+    // We do NOT trust d_type here — always stat() to classify.
+    "DENT_RECLEN":    Initialize=16
+    "DENT_NAME":      Initialize=18
+
+    "MAX_CONTENT":    Initialize=1048576    // 1 MiB cap on per-file source we'll parse
+    "BUF_INIT":       Initialize=4096
+    "WALK_MAX_DEPTH": Initialize=24
+
+    "DEFAULT_QUERY_LIMIT":  Initialize=15
+    "DEFAULT_CALLER_LIMIT": Initialize=25
+
+    "ESC_BUF":             Initialize=8192
+}
+
+
+// =============================================================================
+// PATH SCRATCH MAILBOXES — producer/consumer pattern from the compiler's
+// Lex.tok_buf design. Instead of Allocate-per-call (which churns the heap
+// and corrupts long-lived locals when the allocator hands later calls
+// memory that overlaps with already-issued buffers), each Path_* helper
+// writes into a stable preallocated buffer. Callers MUST consume the
+// result before calling the same helper again.
+//
+// We provide three mailboxes so a caller can hold three outputs at once
+// (e.g. dirname + basename + ext for the same path).
+// =============================================================================
+FixedPool.PathScratch {
+    "buf_a":   Initialize=0, CanChange=True
+    "buf_b":   Initialize=0, CanChange=True
+    "buf_c":   Initialize=0, CanChange=True
+    "cap":     Initialize=4096
+}
+
+// Response content mailbox — every Op_* writes its output here.
+// Single producer, single consumer, single ownership: each request
+// drains this buffer end-to-end before the next request is handled.
+// Sized for the cc_tools 60 KiB output ceiling plus headroom.
+FixedPool.RespBuf {
+    "buf":     Initialize=0, CanChange=True
+    "len":     Initialize=0, CanChange=True
+    "cap":     Initialize=131072
+}
+
+// Scratch mailboxes that survive across the inner per-node loop of an op
+// handler — separate from PathScratch which gets stomped by per-iteration
+// Path_Basename calls.
+FixedPool.OpScratch {
+    "needle":  Initialize=0, CanChange=True   // lowercased query symbol/keyword
+    "tok_lc":  Initialize=0, CanChange=True   // lowercased per-node tok
+    "tmp":     Initialize=0, CanChange=True   // free-form short-lived
+    "cap":     Initialize=4096
+}
+
+// =============================================================================
+// WALKER STATE — recursive directory descent for op=index.
+//
+// `path` holds the current absolute path being walked; recursion appends
+// "/<name>" on entry and truncates on return. `proot_len` is the length
+// of the project-root prefix so Walker_RelOffset() can produce
+// project-relative paths cheaply. Single buffer == single mailbox; the
+// walker is single-threaded and doesn't reentrantly hold path slices.
+// =============================================================================
+FixedPool.Walker {
+    "path":         Initialize=0, CanChange=True
+    "path_len":     Initialize=0, CanChange=True
+    "proot_len":    Initialize=0, CanChange=True
+    "dent_buf":     Initialize=0, CanChange=True   // unused — kept for compat
+    "dent_slab":    Initialize=0, CanChange=True   // depth-indexed: WALK_MAX_DEPTH × DENTS_BUF, zero Arena growth
+    "depth":        Initialize=0, CanChange=True   // current recursion depth index into dent_slab
+    "join_buf":     Initialize=0, CanChange=True
+    "exts_csv":     Initialize=0, CanChange=True
+    "files_obj":    Initialize=0, CanChange=True
+    "n_new":        Initialize=0, CanChange=True
+    "n_updated":    Initialize=0, CanChange=True
+    "n_skipped":    Initialize=0, CanChange=True
+    "n_failed":     Initialize=0, CanChange=True
+    "n_total":      Initialize=0, CanChange=True
+}
+
+// Pre-allocated "h1".."h6" strings for Parse_Markdown — 6 × 3 bytes.
+// Indexed as slab[(level-1)*3], level=1..6. Eliminates Allocate(4) per heading.
+FixedPool.HeadingCats {
+    "slab": Initialize=0, CanChange=True
+}
+
+// AiLang call-graph noise filter — control flow + I/O builtins we don't
+// want to record as edges. Built once at startup as XSHash<name -> 1>.
+FixedPool.Builtins {
+    "table":   Initialize=0, CanChange=True
+}
+
+
+// =============================================================================
+// MUTABLE STATE
+// =============================================================================
+FixedPool.CCRelState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+
+    "home":          Initialize=0, CanChange=True
+    "store_dir":     Initialize=0, CanChange=True
+    "index_path":    Initialize=0, CanChange=True
+
+    "last_mode":     Initialize=0, CanChange=True
+    "stat_buf":      Initialize=0, CanChange=True   // pre-allocated 144-byte statbuf, reused every FS_Stat call
+
+    // Indexing pass counters (re-zeroed at the start of every Op_Index)
+    "ix_new":        Initialize=0, CanChange=True
+    "ix_updated":    Initialize=0, CanChange=True
+    "ix_skipped":    Initialize=0, CanChange=True
+    "ix_failed":     Initialize=0, CanChange=True
+
+    // Comma-list of accepted extensions for the active index pass.
+    // Stored as a string with leading + trailing comma for substring matching:
+    //   ",ailang,py,sh,md,"
+    "ix_ext_csv":    Initialize=0, CanChange=True
+
+    // Project root (absolute) for the active index pass.
+    "ix_proot":      Initialize=0, CanChange=True
+
+    // Files object (XSHash) for the active index pass.
+    "ix_files":      Initialize=0, CanChange=True
+
+    // Names whose calls we suppress as graph noise (control flow / I/O).
+    // Built once at startup as an XSHash<name -> 1>.
+    "builtins":      Initialize=0, CanChange=True
+
+    // PostgreSQL connection handle and project id.
+    "conn":          Initialize=0, CanChange=True
+    "project_id":    Initialize=0, CanChange=True
+    "esc_buf":       Initialize=0, CanChange=True
+}
+
+
+// =============================================================================
+// SCHEMA
+// =============================================================================
+Function.CCRelmem_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Relmem", "Symbolic memory: language-agnostic knowledge graph over project files. Supports 200+ languages via ctags. Use before grep to find definitions, call graphs, import dependencies, and N-hop relationships.")
+        UtilArgs_AddField(s, "op", "string", 1, "Operation: status | summary | query | where | symbols | focus | callers | calls | graph | imports | dependents | index | forget | drop", "op")
+        UtilArgs_AddField(s, "path", "string", 0, "File or directory path (op-dependent: target dir for index, file for symbols/focus/forget)", "path")
+        UtilArgs_AddField(s, "symbol", "string", 0, "Symbol name to look up (where, callers, calls, focus)", "symbol")
+        UtilArgs_AddField(s, "keywords", "string", 0, "Space-separated search keywords (query)", "keywords")
+        UtilArgs_AddField(s, "limit", "int", 0, "Result limit (query default 15, callers default 25)", "limit")
+        UtilArgs_SetDefault(s, "limit", "0")
+        UtilArgs_AddField(s, "exts", "string", 0, "Comma-separated extensions to index (default: ailang,py,sh,md,c,zig,html,json,ts,js,rs,go,java)", "exts")
+        UtilArgs_AddField(s, "project", "string", 0, "Project root (summary, drop). Defaults to nearest .git ancestor of cwd.", "project")
+        ReturnValue(s)
+    }
+}
+
+
+// =============================================================================
+// FILE I/O HELPERS — thin syscall wrappers
+// =============================================================================
+Function.FS_Open {
+    Input: path: Address
+    Input: flags: Integer
+    Input: mode: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(CCRelSys.SYS_OPEN, path, flags, mode)) }
+}
+
+Function.FS_Read {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: n: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(CCRelSys.SYS_READ, fd, buf, n)) }
+}
+
+Function.FS_Write {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: n: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(CCRelSys.SYS_WRITE, fd, buf, n)) }
+}
+
+Function.FS_Close {
+    Input: fd: Integer
+    Body: { SystemCall(CCRelSys.SYS_CLOSE, fd) }
+}
+
+// stat(path): returns mtime in seconds, or -1 on missing/error.
+// Caches mode in CCRelState.last_mode for callers that want both.
+// st_mode is a 4-byte field — must Dereference as "dword", otherwise
+// the upper 4 bytes (st_uid) pollute the value and S_IFMT masking fails.
+Function.FS_Stat {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        rc = SystemCall(CCRelSys.SYS_STAT, path, CCRelState.stat_buf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: { ReturnValue(-1) }
+        mtime = Dereference(Add(CCRelState.stat_buf, CCRelConst.ST_MTIME_OFF))
+        mode = Dereference(Add(CCRelState.stat_buf, CCRelConst.ST_MODE_OFF), "dword")
+        CCRelState.last_mode = mode
+        ReturnValue(mtime)
+    }
+}
+
+Function.FS_IsDir {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        rc = SystemCall(CCRelSys.SYS_STAT, path, CCRelState.stat_buf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: { ReturnValue(0) }
+        mode = Dereference(Add(CCRelState.stat_buf, CCRelConst.ST_MODE_OFF), "dword")
+        masked = BitwiseAnd(mode, CCRelSys.S_IFMT)
+        IfCondition EqualTo(masked, CCRelSys.S_IFDIR) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.FS_Exists {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        rc = SystemCall(CCRelSys.SYS_STAT, path, CCRelState.stat_buf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.FS_Mkdir {
+    Input: path: Address
+    Output: Integer
+    Body: { ReturnValue(SystemCall(CCRelSys.SYS_MKDIR, path, CCRelSys.MODE_DIR, 0)) }
+}
+
+Function.FS_MkdirP {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(path)
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(Add(plen, 1))
+        MemoryCopy(buf, path, plen)
+        SetByte(buf, plen, 0)
+        i = 1
+        WhileLoop LessThan(i, plen) {
+            IfCondition EqualTo(GetByte(buf, i), 47) ThenBlock: {
+                SetByte(buf, i, 0)
+                IfCondition EqualTo(FS_Exists(buf), 0) ThenBlock: { FS_Mkdir(buf) }
+                SetByte(buf, i, 47)
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(FS_Exists(buf), 0) ThenBlock: { FS_Mkdir(buf) }
+        Deallocate(buf, Add(plen, 1))
+        ReturnValue(0)
+    }
+}
+
+// Read entire file into a NUL-terminated allocated string. 0 on error.
+// No cap — callers that need to bound input (e.g. source-file parsers)
+// should use FS_ReadAllCapped.
+Function.FS_ReadAll {
+    Input: path: Address
+    Output: Address
+    Body: { ReturnValue(FS_ReadAllCapped(path, 0)) }
+}
+
+// max_bytes=0 means unlimited.
+Function.FS_ReadAllCapped {
+    Input: path: Address
+    Input: max_bytes: Integer
+    Output: Address
+    Body: {
+        fd = FS_Open(path, CCRelSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        statbuf = Allocate(CCRelConst.STATBUF_SIZE)
+        rc = SystemCall(CCRelSys.SYS_FSTAT, fd, statbuf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Deallocate(statbuf, CCRelConst.STATBUF_SIZE)
+            FS_Close(fd)
+            ReturnValue(0)
+        }
+        size = Dereference(Add(statbuf, CCRelConst.ST_SIZE_OFF))
+        Deallocate(statbuf, CCRelConst.STATBUF_SIZE)
+        IfCondition LessEqual(size, 0) ThenBlock: {
+            FS_Close(fd)
+            empty = Allocate(1)
+            SetByte(empty, 0, 0)
+            ReturnValue(empty)
+        }
+        IfCondition GreaterThan(max_bytes, 0) ThenBlock: {
+            IfCondition GreaterThan(size, max_bytes) ThenBlock: { size = max_bytes }
+        }
+        out = Allocate(Add(size, 1))
+        total = 0
+        WhileLoop LessThan(total, size) {
+            r = FS_Read(fd, Add(out, total), Subtract(size, total))
+            IfCondition LessEqual(r, 0) ThenBlock: { total = size }
+            IfCondition GreaterThan(r, 0) ThenBlock: { total = Add(total, r) }
+        }
+        SetByte(out, total, 0)
+        FS_Close(fd)
+        ReturnValue(out)
+    }
+}
+
+Function.FS_WriteAtomic {
+    Input: path: Address
+    Input: content: Address
+    Output: Integer
+    Body: {
+        clen = StringLength(content)
+        plen = StringLength(path)
+        tmp = Allocate(Add(plen, 5))
+        MemoryCopy(tmp, path, plen)
+        SetByte(tmp, plen, 46)
+        SetByte(tmp, Add(plen, 1), 116)
+        SetByte(tmp, Add(plen, 2), 109)
+        SetByte(tmp, Add(plen, 3), 112)
+        SetByte(tmp, Add(plen, 4), 0)
+        flags = Add(Add(CCRelSys.O_WRONLY, CCRelSys.O_CREAT), CCRelSys.O_TRUNC)
+        fd = FS_Open(tmp, flags, CCRelSys.MODE_FILE)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            Deallocate(tmp, Add(plen, 5))
+            ReturnValue(-1)
+        }
+        written = 0
+        WhileLoop LessThan(written, clen) {
+            w = FS_Write(fd, Add(content, written), Subtract(clen, written))
+            IfCondition LessEqual(w, 0) ThenBlock: { written = clen }
+            IfCondition GreaterThan(w, 0) ThenBlock: { written = Add(written, w) }
+        }
+        FS_Close(fd)
+        rc = SystemCall(CCRelSys.SYS_RENAME, tmp, path, 0)
+        Deallocate(tmp, Add(plen, 5))
+        ReturnValue(rc)
+    }
+}
+
+
+// =============================================================================
+// ENVIRONMENT
+// =============================================================================
+Function.Env_LoadHome {
+    Output: Address
+    Body: {
+        IfCondition NotEqual(CCRelState.home, 0) ThenBlock: { ReturnValue(CCRelState.home) }
+        fd = SystemCall(CCRelSys.SYS_OPEN, "/proc/self/environ", CCRelSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(CCRelConst.ENV_BUF)
+        n = SystemCall(CCRelSys.SYS_READ, fd, buf, Subtract(CCRelConst.ENV_BUF, 1))
+        SystemCall(CCRelSys.SYS_CLOSE, fd)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, CCRelConst.ENV_BUF)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            // Match HOME=
+            ok = 0
+            IfCondition LessThan(Add(i, 5), n) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, i), 72) ThenBlock: {
+                    IfCondition EqualTo(GetByte(buf, Add(i, 1)), 79) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(i, 2)), 77) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(i, 3)), 69) ThenBlock: {
+                                IfCondition EqualTo(GetByte(buf, Add(i, 4)), 61) ThenBlock: {
+                                    ok = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                start = Add(i, 5)
+                end = start
+                WhileLoop And(LessThan(end, n), NotEqual(GetByte(buf, end), 0)) {
+                    end = Add(end, 1)
+                }
+                hlen = Subtract(end, start)
+                home = Allocate(Add(hlen, 1))
+                MemoryCopy(home, Add(buf, start), hlen)
+                SetByte(home, hlen, 0)
+                Deallocate(buf, CCRelConst.ENV_BUF)
+                CCRelState.home = home
+                ReturnValue(home)
+            }
+            // Skip to next null-terminated entry
+            WhileLoop And(LessThan(i, n), NotEqual(GetByte(buf, i), 0)) {
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, CCRelConst.ENV_BUF)
+        ReturnValue(0)
+    }
+}
+
+
+// =============================================================================
+// Env_LoadVar — generic env reader (reads any var from /proc/self/environ)
+// =============================================================================
+Function.Env_LoadVar {
+    Input: var_name: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(CCRelSys.SYS_OPEN, "/proc/self/environ", CCRelSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(CCRelConst.ENV_BUF)
+        n = SystemCall(CCRelSys.SYS_READ, fd, buf, Subtract(CCRelConst.ENV_BUF, 1))
+        SystemCall(CCRelSys.SYS_CLOSE, fd)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, CCRelConst.ENV_BUF)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        var_len = StringLength(var_name)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, var_len) {
+                IfCondition NotEqual(GetByte(buf, Add(i, j)), GetByte(var_name, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, var_len)), 61) ThenBlock: {
+                    val_start = Add(i, Add(var_len, 1))
+                    val_end = val_start
+                    WhileLoop And(LessThan(val_end, n), NotEqual(GetByte(buf, val_end), 0)) {
+                        val_end = Add(val_end, 1)
+                    }
+                    val_len = Subtract(val_end, val_start)
+                    out = Allocate(Add(val_len, 1))
+                    MemoryCopy(out, Add(buf, val_start), val_len)
+                    SetByte(out, val_len, 0)
+                    Deallocate(buf, CCRelConst.ENV_BUF)
+                    ReturnValue(out)
+                }
+            }
+            WhileLoop And(LessThan(i, n), NotEqual(GetByte(buf, i), 0)) {
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, CCRelConst.ENV_BUF)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PATH HELPERS
+// =============================================================================
+// Process-lifetime copy of a NUL-terminated string. Used to detach a
+// mailbox return value into stable storage when the mailbox will be
+// rewritten by a later call (e.g. chained Path_Joins).
+Function.Str_Dup {
+    Input: s: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        slen = StringLength(s)
+        out = Allocate(Add(slen, 1))
+        MemoryCopy(out, s, slen)
+        SetByte(out, slen, 0)
+        ReturnValue(out)
+    }
+}
+
+// Path_Join writes into Walker.join_buf (mailbox). Caller must consume
+// the result before the next Path_Join call. Cap is PATH_MAX.
+Function.Path_Join {
+    Input: a: Address
+    Input: b: Address
+    Output: Address
+    Body: {
+        alen = StringLength(a)
+        blen = StringLength(b)
+        needs_sep = 1
+        IfCondition GreaterThan(alen, 0) ThenBlock: {
+            IfCondition EqualTo(GetByte(a, Subtract(alen, 1)), 47) ThenBlock: { needs_sep = 0 }
+        }
+        IfCondition EqualTo(alen, 0) ThenBlock: { needs_sep = 0 }
+
+        cap_minus_1 = Subtract(CCRelConst.PATH_MAX, 1)
+        IfCondition GreaterThan(alen, cap_minus_1) ThenBlock: { alen = cap_minus_1 }
+        i = 0
+        WhileLoop LessThan(i, alen) {
+            SetByte(Walker.join_buf, i, GetByte(a, i))
+            i = Add(i, 1)
+        }
+        pos = alen
+        IfCondition EqualTo(needs_sep, 1) ThenBlock: {
+            IfCondition LessThan(pos, cap_minus_1) ThenBlock: {
+                SetByte(Walker.join_buf, pos, 47)
+                pos = Add(pos, 1)
+            }
+        }
+        j = 0
+        WhileLoop LessThan(j, blen) {
+            IfCondition LessThan(pos, cap_minus_1) ThenBlock: {
+                SetByte(Walker.join_buf, pos, GetByte(b, j))
+                pos = Add(pos, 1)
+            }
+            j = Add(j, 1)
+        }
+        SetByte(Walker.join_buf, pos, 0)
+        ReturnValue(Walker.join_buf)
+    }
+}
+
+// All three Path_* helpers write into a stable scratch mailbox
+// (PathScratch.buf_a/b/c) and return a pointer into that buffer. The
+// caller must consume the result before calling the same helper again.
+// No Allocate per call → no heap reuse → no corruption of held buffers.
+//
+// Each helper picks its mailbox so a caller can simultaneously hold
+// dirname + basename + ext from the same path.
+Function.Path_WriteSlice {
+    Input: dst: Address
+    Input: src: Address
+    Input: start: Integer
+    Input: blen: Integer
+    Output: Address
+    Body: {
+        IfCondition LessThan(blen, 0) ThenBlock: { blen = 0 }
+        IfCondition GreaterThan(blen, Subtract(PathScratch.cap, 1)) ThenBlock: {
+            blen = Subtract(PathScratch.cap, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, blen) {
+            SetByte(dst, i, GetByte(src, Add(start, i)))
+            i = Add(i, 1)
+        }
+        SetByte(dst, blen, 0)
+        ReturnValue(dst)
+    }
+}
+
+Function.Path_Basename {
+    Input: p: Address
+    Output: Address
+    Body: {
+        plen = StringLength(p)
+        last_slash = -1
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition EqualTo(GetByte(p, i), 47) ThenBlock: { last_slash = i }
+            i = Add(i, 1)
+        }
+        start = Add(last_slash, 1)
+        blen = Subtract(plen, start)
+        ReturnValue(Path_WriteSlice(PathScratch.buf_a, p, start, blen))
+    }
+}
+
+Function.Path_Dirname {
+    Input: p: Address
+    Output: Address
+    Body: {
+        plen = StringLength(p)
+        last_slash = -1
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition EqualTo(GetByte(p, i), 47) ThenBlock: { last_slash = i }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(last_slash, 0) ThenBlock: {
+            SetByte(PathScratch.buf_b, 0, 46)
+            SetByte(PathScratch.buf_b, 1, 0)
+            ReturnValue(PathScratch.buf_b)
+        }
+        IfCondition EqualTo(last_slash, 0) ThenBlock: {
+            SetByte(PathScratch.buf_b, 0, 47)
+            SetByte(PathScratch.buf_b, 1, 0)
+            ReturnValue(PathScratch.buf_b)
+        }
+        ReturnValue(Path_WriteSlice(PathScratch.buf_b, p, 0, last_slash))
+    }
+}
+
+// Returns ".ext" (with leading dot) or empty string if no extension.
+// Forward-walk: track last '.', reset on '/'.
+Function.Path_Ext {
+    Input: p: Address
+    Output: Address
+    Body: {
+        plen = StringLength(p)
+        dot = -1
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            ch = GetByte(p, i)
+            IfCondition EqualTo(ch, 47) ThenBlock: { dot = -1 }
+            IfCondition EqualTo(ch, 46) ThenBlock: { dot = i }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(dot, 0) ThenBlock: {
+            SetByte(PathScratch.buf_c, 0, 0)
+            ReturnValue(PathScratch.buf_c)
+        }
+        elen = Subtract(plen, dot)
+        ReturnValue(Path_WriteSlice(PathScratch.buf_c, p, dot, elen))
+    }
+}
+
+// Walk upward from `start` looking for a directory containing .git.
+// Returns absolute path of the project root (caller frees), or `start`
+// (copied) if no .git ancestor was found.
+Function.Path_GitRoot {
+    Input: start: Address
+    Output: Address
+    Body: {
+        startlen = StringLength(start)
+        cur = Allocate(Add(startlen, 1))
+        MemoryCopy(cur, start, startlen)
+        SetByte(cur, startlen, 0)
+        cur_sz = Add(startlen, 1)
+
+        WhileLoop 1 {
+            git_path = Path_Join(cur, ".git")
+            present = FS_Exists(git_path)
+            IfCondition EqualTo(present, 1) ThenBlock: { ReturnValue(cur) }
+
+            // Stop at root
+            IfCondition EqualTo(StringLength(cur), 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(cur, 0), 47) ThenBlock: {
+                    Deallocate(cur, cur_sz)
+                    out = Allocate(Add(startlen, 1))
+                    MemoryCopy(out, start, startlen)
+                    SetByte(out, startlen, 0)
+                    ReturnValue(out)
+                }
+            }
+
+            parent = Path_Dirname(cur)
+            IfCondition EqualTo(StringCompare(parent, cur), 0) ThenBlock: {
+                ReturnValue(cur)
+            }
+            plen = StringLength(parent)
+            next_cur = Allocate(Add(plen, 1))
+            MemoryCopy(next_cur, parent, plen)
+            SetByte(next_cur, plen, 0)
+            Deallocate(cur, cur_sz)
+            cur = next_cur
+            cur_sz = Add(plen, 1)
+        }
+        ReturnValue(cur)
+    }
+}
+
+// "/proj/sub/file" relativized to "/proj" -> "sub/file".
+// If start doesn't begin with root, returns a copy of start (caller frees).
+Function.Path_RelativeTo {
+    Input: full: Address
+    Input: root: Address
+    Output: Address
+    Body: {
+        flen = StringLength(full)
+        rlen = StringLength(root)
+        IfCondition GreaterEqual(rlen, flen) ThenBlock: {
+            out = Allocate(Add(flen, 1))
+            MemoryCopy(out, full, flen)
+            SetByte(out, flen, 0)
+            ReturnValue(out)
+        }
+        // Match prefix
+        i = 0
+        match = 1
+        WhileLoop LessThan(i, rlen) {
+            IfCondition NotEqual(GetByte(full, i), GetByte(root, i)) ThenBlock: {
+                match = 0
+                i = rlen
+            } ElseBlock: { i = Add(i, 1) }
+        }
+        IfCondition EqualTo(match, 0) ThenBlock: {
+            out = Allocate(Add(flen, 1))
+            MemoryCopy(out, full, flen)
+            SetByte(out, flen, 0)
+            ReturnValue(out)
+        }
+        // Skip a trailing slash in root if needed
+        skip = rlen
+        IfCondition LessThan(skip, flen) ThenBlock: {
+            IfCondition EqualTo(GetByte(full, skip), 47) ThenBlock: { skip = Add(skip, 1) }
+        }
+        rest = Subtract(flen, skip)
+        out = Allocate(Add(rest, 1))
+        MemoryCopy(out, Add(full, skip), rest)
+        SetByte(out, rest, 0)
+        ReturnValue(out)
+    }
+}
+
+
+// =============================================================================
+// RESPONSE BUFFER — single FixedPool mailbox.
+//
+// Earlier draft used a heap-allocated grow-on-demand buffer. Pattern broke
+// on this allocator: Allocate during Buf_AppendInt (NumberToString) and
+// during downstream JSON.SetString/JSON.NewObject ended up returning
+// memory that overlapped with the content payload, so by the time
+// SendResult ran PrintMessage(content) the bytes were partially smashed
+// — segfaulting in the middle of a string.
+//
+// Mailbox pattern: one big buffer, allocated once at startup, reused for
+// every request. Op_* helpers write into RespBuf.buf and update
+// RespBuf.len. Buf_Reset() at the start of each handler. RespBuf.buf is
+// a stable address — no Allocate-per-use, no aliasing.
+// =============================================================================
+
+Function.Buf_Reset {
+    Body: {
+        RespBuf.len = 0
+        SetByte(RespBuf.buf, 0, 0)
+    }
+}
+
+Function.Buf_AppendBytes {
+    Input: src: Address
+    Input: n: Integer
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        // Truncate at cap-1 so we always have room for a trailing NUL.
+        avail = Subtract(Subtract(RespBuf.cap, 1), RespBuf.len)
+        IfCondition LessEqual(avail, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(n, avail) ThenBlock: { n = avail }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(RespBuf.buf, Add(RespBuf.len, i), GetByte(src, i))
+            i = Add(i, 1)
+        }
+        RespBuf.len = Add(RespBuf.len, n)
+        SetByte(RespBuf.buf, RespBuf.len, 0)
+    }
+}
+
+Function.Buf_AppendStr {
+    Input: s: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        Buf_AppendBytes(s, StringLength(s))
+    }
+}
+
+Function.Buf_AppendChar {
+    Input: ch: Integer
+    Body: {
+        IfCondition GreaterEqual(RespBuf.len, Subtract(RespBuf.cap, 1)) ThenBlock: { ReturnValue(0) }
+        SetByte(RespBuf.buf, RespBuf.len, ch)
+        RespBuf.len = Add(RespBuf.len, 1)
+        SetByte(RespBuf.buf, RespBuf.len, 0)
+    }
+}
+
+Function.Buf_AppendInt {
+    Input: n: Integer
+    Body: {
+        s = NumberToString(n)
+        Buf_AppendStr(s)
+    }
+}
+
+Function.Buf_AppendNL {
+    Body: { Buf_AppendChar(10) }
+}
+
+// Returns the current contents as a NUL-terminated string. The pointer is
+// stable across requests — caller must consume before the next handler runs.
+Function.Buf_Content {
+    Output: Address
+    Body: { ReturnValue(RespBuf.buf) }
+}
+
+
+// =============================================================================
+// POSTGRES STORAGE LAYER
+// =============================================================================
+
+// Escape single-quotes for SQL: ' -> ''
+// Writes into CCRelState.esc_buf (8 KB). Returns pointer to esc_buf.
+// NOT re-entrant — consume before calling again.
+Function.Rel_EscStr {
+    Input: s: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue("") }
+        src = s
+        dst = CCRelState.esc_buf
+        pos = 0
+        cap = Subtract(CCRelConst.ESC_BUF, 2)
+        WhileLoop 1 {
+            ch = GetByte(src, 0)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            IfCondition GreaterEqual(pos, cap) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(ch, 39) ThenBlock: {
+                SetByte(dst, pos, 39)
+                pos = Add(pos, 1)
+                SetByte(dst, pos, 39)
+                pos = Add(pos, 1)
+            } ElseBlock: {
+                SetByte(dst, pos, ch)
+                pos = Add(pos, 1)
+            }
+            src = Add(src, 1)
+        }
+        SetByte(dst, pos, 0)
+        ReturnValue(dst)
+    }
+}
+
+Function.Rel_Migrate {
+    Body: {
+        conn = CCRelState.conn
+        PG_Query(conn, "CREATE TABLE IF NOT EXISTS hc_symbol_edges (id SERIAL PRIMARY KEY, file_id INTEGER REFERENCES hc_files(id) ON DELETE CASCADE, project_id INTEGER REFERENCES hc_projects(id), caller TEXT NOT NULL, callee TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'calls')")
+        PG_Query(conn, "ALTER TABLE hc_symbol_edges ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'calls'")
+        PG_Query(conn, "CREATE INDEX IF NOT EXISTS hc_sym_edges_callee ON hc_symbol_edges(project_id, callee)")
+        PG_Query(conn, "CREATE INDEX IF NOT EXISTS hc_sym_edges_caller ON hc_symbol_edges(project_id, caller)")
+        PG_Query(conn, "CREATE INDEX IF NOT EXISTS hc_sym_edges_kind ON hc_symbol_edges(project_id, kind)")
+    }
+}
+
+Function.Rel_GetOrCreateProject {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        esc = Rel_EscStr(name)
+        sql = StringConcat("INSERT INTO hc_projects (name, path) VALUES ('", esc)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, esc)
+        sql = StringConcat(sql, "') ON CONFLICT (name) DO UPDATE SET path=EXCLUDED.path RETURNING id")
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: { PG_DestroyResult(rows)  ReturnValue(0) }
+        row = Array.Get(rows, 0)
+        id_str = Hash.Get(row, "id")
+        id_int = StringToNumber(id_str)
+        PG_DestroyResult(rows)
+        ReturnValue(id_int)
+    }
+}
+
+Function.Rel_UpsertFile {
+    Input: abs_path: Address
+    Input: rel_path: Address
+    Input: lang: Address
+    Input: mtime_str: Address
+    Output: Integer
+    Body: {
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_abs = Rel_EscStr(abs_path)
+        abs_copy = Allocate(Add(StringLength(esc_abs), 1))
+        MemoryCopy(abs_copy, esc_abs, Add(StringLength(esc_abs), 1))
+        esc_rel = Rel_EscStr(rel_path)
+        rel_copy = Allocate(Add(StringLength(esc_rel), 1))
+        MemoryCopy(rel_copy, esc_rel, Add(StringLength(esc_rel), 1))
+        esc_lang = Rel_EscStr(lang)
+        lang_copy = Allocate(Add(StringLength(esc_lang), 1))
+        MemoryCopy(lang_copy, esc_lang, Add(StringLength(esc_lang), 1))
+        esc_mtime = Rel_EscStr(mtime_str)
+        mtime_copy = Allocate(Add(StringLength(esc_mtime), 1))
+        MemoryCopy(mtime_copy, esc_mtime, Add(StringLength(esc_mtime), 1))
+        sql = StringConcat("INSERT INTO hc_files (project_id, path, rel_path, lang, hash) VALUES (", proj_str)
+        sql = StringConcat(sql, ",'")
+        sql = StringConcat(sql, abs_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, rel_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, lang_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, mtime_copy)
+        sql = StringConcat(sql, "') ON CONFLICT (project_id, path) DO UPDATE SET rel_path=EXCLUDED.rel_path, lang=EXCLUDED.lang, hash=EXCLUDED.hash, indexed_at=NOW() RETURNING id")
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: { PG_DestroyResult(rows)  ReturnValue(0) }
+        row = Array.Get(rows, 0)
+        id_str = Hash.Get(row, "id")
+        file_id = StringToNumber(id_str)
+        PG_DestroyResult(rows)
+        ReturnValue(file_id)
+    }
+}
+
+Function.Rel_FileUnchanged {
+    Input: abs_path: Address
+    Input: mtime_str: Address
+    Output: Integer
+    Body: {
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_path = Rel_EscStr(abs_path)
+        sql = StringConcat("SELECT hash FROM hc_files WHERE project_id=", proj_str)
+        sql = StringConcat(sql, " AND path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' LIMIT 1")
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: { PG_DestroyResult(rows)  ReturnValue(0) }
+        row = Array.Get(rows, 0)
+        hash_str = Hash.Get(row, "hash")
+        same = 0
+        IfCondition NotEqual(hash_str, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(hash_str, mtime_str), 0) ThenBlock: { same = 1 }
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(same)
+    }
+}
+
+Function.Rel_ClearFileSymbols {
+    Input: file_id: Integer
+    Body: {
+        fid_str = NumberToString(file_id)
+        sql = StringConcat("DELETE FROM hc_symbol_edges WHERE file_id=", fid_str)
+        PG_Query(CCRelState.conn, sql)
+        sql = StringConcat("DELETE FROM hc_symbols WHERE file_id=", fid_str)
+        PG_Query(CCRelState.conn, sql)
+    }
+}
+
+// Delete all symbol edges, symbols, and files for the current project.
+// Order matters: hc_symbols references hc_files without ON DELETE CASCADE.
+Function.Rel_DropProject {
+    Body: {
+        proj_str = NumberToString(CCRelState.project_id)
+        sql = StringConcat("DELETE FROM hc_symbol_edges WHERE project_id=", proj_str)
+        PG_Query(CCRelState.conn, sql)
+        sql = StringConcat("DELETE FROM hc_symbols WHERE project_id=", proj_str)
+        PG_Query(CCRelState.conn, sql)
+        sql = StringConcat("DELETE FROM hc_files WHERE project_id=", proj_str)
+        PG_Query(CCRelState.conn, sql)
+        ReturnValue(0)
+    }
+}
+
+Function.Rel_InsertSymbol {
+    Input: file_id: Integer
+    Input: tok: Address
+    Input: cat: Address
+    Input: line_no: Integer
+    Output: Integer
+    Body: {
+        fid_str = NumberToString(file_id)
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_tok = Rel_EscStr(tok)
+        tok_copy = Allocate(Add(StringLength(esc_tok), 1))
+        MemoryCopy(tok_copy, esc_tok, Add(StringLength(esc_tok), 1))
+        esc_cat = Rel_EscStr(cat)
+        line_str = NumberToString(line_no)
+        sql = StringConcat("INSERT INTO hc_symbols (file_id, project_id, name, kind, line_start) VALUES (", fid_str)
+        sql = StringConcat(sql, ",")
+        sql = StringConcat(sql, proj_str)
+        sql = StringConcat(sql, ",'")
+        sql = StringConcat(sql, tok_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, esc_cat)
+        sql = StringConcat(sql, "',")
+        sql = StringConcat(sql, line_str)
+        sql = StringConcat(sql, ") ON CONFLICT DO NOTHING RETURNING id")
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: { PG_DestroyResult(rows)  ReturnValue(0) }
+        row = Array.Get(rows, 0)
+        id_str = Hash.Get(row, "id")
+        sym_id = StringToNumber(id_str)
+        PG_DestroyResult(rows)
+        ReturnValue(sym_id)
+    }
+}
+
+Function.Rel_InsertEdge {
+    Input: file_id: Integer
+    Input: caller: Address
+    Input: callee: Address
+    Input: kind: Address
+    Body: {
+        fid_str = NumberToString(file_id)
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_caller = Rel_EscStr(caller)
+        caller_copy = Allocate(Add(StringLength(esc_caller), 1))
+        MemoryCopy(caller_copy, esc_caller, Add(StringLength(esc_caller), 1))
+        esc_callee = Rel_EscStr(callee)
+        callee_copy = Allocate(Add(StringLength(esc_callee), 1))
+        MemoryCopy(callee_copy, esc_callee, Add(StringLength(esc_callee), 1))
+        esc_kind = Rel_EscStr(kind)
+        sql = StringConcat("INSERT INTO hc_symbol_edges (file_id, project_id, caller, callee, kind) VALUES (", fid_str)
+        sql = StringConcat(sql, ",")
+        sql = StringConcat(sql, proj_str)
+        sql = StringConcat(sql, ",'")
+        sql = StringConcat(sql, caller_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, callee_copy)
+        sql = StringConcat(sql, "','")
+        sql = StringConcat(sql, esc_kind)
+        sql = StringConcat(sql, "') ON CONFLICT DO NOTHING")
+        PG_Query(CCRelState.conn, sql)
+    }
+}
+
+
+// =============================================================================
+// CTAGS INTEGRATION — language-agnostic symbol extraction via universal-ctags.
+// Falls back to hand-written parsers if ctags binary not found.
+// =============================================================================
+
+FixedPool.CtagsState {
+    "binary":     Initialize=0, CanChange=True   // path to ctags binary, 0 = not found
+    "read_buf":   Initialize=0, CanChange=True   // 128KB read buffer for pipe output
+    "read_cap":   Initialize=131072
+}
+
+// stat() follows the /usr/bin/ctags symlink to ctags-universal.
+// CCRelState.stat_buf must already be allocated; a null buffer makes
+// stat return EFAULT and every path looks missing.
+// Check the usual names, then the Debian universal-ctags binary.
+SubRoutine.Ctags_FindBinary {
+    CtagsState.read_buf = Allocate(CtagsState.read_cap)
+    p1 = "/usr/bin/ctags"
+    IfCondition EqualTo(FS_Exists(p1), 1) ThenBlock: {
+        CtagsState.binary = p1
+        ReturnValue(0)
+    }
+    p2 = "/usr/local/bin/ctags"
+    IfCondition EqualTo(FS_Exists(p2), 1) ThenBlock: {
+        CtagsState.binary = p2
+        ReturnValue(0)
+    }
+    p3 = "/usr/bin/ctags-universal"
+    IfCondition EqualTo(FS_Exists(p3), 1) ThenBlock: {
+        CtagsState.binary = p3
+        ReturnValue(0)
+    }
+    p4 = "/usr/local/bin/ctags-universal"
+    IfCondition EqualTo(FS_Exists(p4), 1) ThenBlock: {
+        CtagsState.binary = p4
+        ReturnValue(0)
+    }
+}
+
+// Read all bytes from fd into CtagsState.read_buf until EOF. Returns bytes read.
+Function.Ctags_ReadAll {
+    Input: rfd: Integer
+    Output: Integer
+    Body: {
+        buf = CtagsState.read_buf
+        cap = Subtract(CtagsState.read_cap, 1)
+        total = 0
+        WhileLoop LessThan(total, cap) {
+            nr = SystemCall(CCRelSys.SYS_READ, rfd, Add(buf, total), Subtract(cap, total), 0, 0)
+            IfCondition LessEqual(nr, 0) ThenBlock: { BreakLoop }
+            total = Add(total, nr)
+        }
+        SetByte(buf, total, 0)
+        ReturnValue(total)
+    }
+}
+
+// Parse one ctags JSON line and insert the symbol into hc_symbols.
+// Returns 1 if a symbol was inserted, 0 otherwise.
+Function.Ctags_ParseLine {
+    Input: line_ptr: Address
+    Input: file_id: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(StringLength(line_ptr), 0) ThenBlock: { ReturnValue(0) }
+        parsed = ParseJSON(line_ptr)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        tag = JSON.AsObject(parsed)
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(0) }
+        typ = JSON.GetString(tag, "_type")
+        IfCondition EqualTo(typ, 0) ThenBlock: { ReturnValue(0) }
+        // skip ptag (pseudo-tag header) entries
+        IfCondition NotEqual(StringCompare(typ, "tag"), 0) ThenBlock: { ReturnValue(0) }
+        name = JSON.GetString(tag, "name")
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        kind = JSON.GetString(tag, "kind")
+        IfCondition EqualTo(kind, 0) ThenBlock: { kind = "symbol" }
+        line_no = JSON.GetNumber(tag, "line")
+        Rel_InsertSymbol(file_id, name, kind, line_no)
+        ReturnValue(1)
+    }
+}
+
+// Fork ctags on abs_path, read JSON output, insert symbols for file_id.
+// Returns number of symbols inserted, or -1 on fork/exec failure.
+Function.Ctags_IndexFile {
+    Input: abs_path: Address
+    Input: file_id: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CtagsState.binary, 0) ThenBlock: { ReturnValue(-1) }
+
+        // Build argv: [binary, "--output-format=json", "--fields=+nl", "--sort=no", path, 0]
+        argv = Allocate(48)
+        StoreValue(argv, CtagsState.binary)
+        StoreValue(Add(argv, 8),  "--output-format=json")
+        StoreValue(Add(argv, 16), "--fields=+nl")
+        StoreValue(Add(argv, 24), "--sort=no")
+        StoreValue(Add(argv, 32), abs_path)
+        StoreValue(Add(argv, 40), 0)
+
+        // envp: empty environment
+        envp = Allocate(8)
+        StoreValue(envp, 0)
+
+        // pipe() -> pipefd[0]=read, pipefd[1]=write
+        pipefd = Allocate(8)
+        rc = SystemCall(CCRelSys.SYS_PIPE, pipefd, 0, 0, 0, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Deallocate(argv, 48)
+            Deallocate(envp, 8)
+            Deallocate(pipefd, 8)
+            ReturnValue(-1)
+        }
+        rfd = Dereference(pipefd, "dword")
+        wfd = Dereference(Add(pipefd, 4), "dword")
+
+        pid = SystemCall(CCRelSys.SYS_VFORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD: only syscalls allowed before execve
+            SystemCall(CCRelSys.SYS_DUP2, wfd, 1, 0, 0, 0)
+            SystemCall(CCRelSys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+            SystemCall(CCRelSys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+            SystemCall(CCRelSys.SYS_EXECVE, CtagsState.binary, argv, envp)
+            SystemCall(CCRelSys.SYS_EXIT, 1, 0, 0, 0, 0)
+        }
+
+        // PARENT: close write end, read all output
+        SystemCall(CCRelSys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(CCRelSys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+            Deallocate(argv, 48)
+            Deallocate(envp, 8)
+            Deallocate(pipefd, 8)
+            ReturnValue(-1)
+        }
+
+        total = Ctags_ReadAll(rfd)
+        SystemCall(CCRelSys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+
+        // Reap child
+        stat_buf = Allocate(4)
+        SystemCall(CCRelSys.SYS_WAIT4, pid, stat_buf, 0, 0, 0)
+        Deallocate(stat_buf, 4)
+        Deallocate(argv, 48)
+        Deallocate(envp, 8)
+        Deallocate(pipefd, 8)
+
+        // Parse lines from read buffer
+        buf = CtagsState.read_buf
+        n_syms = 0
+        line_start = 0
+        i = 0
+        WhileLoop LessEqual(i, total) {
+            ch = GetByte(buf, i)
+            IfCondition Or(EqualTo(ch, 10), EqualTo(ch, 0)) ThenBlock: {
+                IfCondition GreaterThan(i, line_start) ThenBlock: {
+                    saved = GetByte(buf, i)
+                    SetByte(buf, i, 0)
+                    inserted = Ctags_ParseLine(Add(buf, line_start), file_id)
+                    SetByte(buf, i, saved)
+                    IfCondition EqualTo(inserted, 1) ThenBlock: {
+                        n_syms = Add(n_syms, 1)
+                    }
+                }
+                line_start = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(n_syms)
+    }
+}
+
+
+// =============================================================================
+// IMPORT SCANNER — generic language-agnostic import edge extraction.
+// Scans content line by line for import patterns; inserts kind='imports' edges
+// linking the file (by rel_path) to the imported module name.
+// =============================================================================
+
+// Extract a bare module name from a quoted/angled string starting at `src`.
+// Writes into `dst` (cap bytes). Strips quotes, angle brackets, extensions.
+// Returns length written, or 0 if nothing useful found.
+Function.Import_ExtractModule {
+    Input: src: Address
+    Input: dst: Address
+    Input: cap: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        // Skip leading whitespace
+        p = 0
+        WhileLoop And(LessThan(p, cap), Or(EqualTo(GetByte(src, p), 32), EqualTo(GetByte(src, p), 9))) {
+            p = Add(p, 1)
+        }
+        // Strip opening quote/angle
+        first = GetByte(src, p)
+        open = 0
+        close_ch = 0
+        IfCondition Or(EqualTo(first, 34), EqualTo(first, 39)) ThenBlock: { open = 1  close_ch = first  p = Add(p, 1) }
+        IfCondition EqualTo(first, 60) ThenBlock: { open = 1  close_ch = 62  p = Add(p, 1) }
+        // Copy until close quote / whitespace / semicolon / newline / NUL
+        wi = 0
+        WhileLoop LessThan(wi, Subtract(cap, 1)) {
+            ch = GetByte(src, p)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(ch, 10) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(ch, 13) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(ch, 59) ThenBlock: { BreakLoop }   // ;
+            IfCondition EqualTo(ch, 41) ThenBlock: { BreakLoop }   // )
+            IfCondition And(EqualTo(open, 1), EqualTo(ch, close_ch)) ThenBlock: { BreakLoop }
+            IfCondition And(EqualTo(open, 0), EqualTo(ch, 32)) ThenBlock: { BreakLoop }
+            SetByte(dst, wi, ch)
+            wi = Add(wi, 1)
+            p = Add(p, 1)
+        }
+        SetByte(dst, wi, 0)
+        ReturnValue(wi)
+    }
+}
+
+// Scan one line for import patterns given the file extension.
+// Inserts a kind='imports' edge (caller=file_rel, callee=module) if found.
+Function.Import_ScanOneLine {
+    Input: line: Address
+    Input: llen: Integer
+    Input: ext: Address
+    Input: file_rel: Address
+    Input: file_id: Integer
+    Body: {
+        // Skip leading whitespace
+        j = 0
+        WhileLoop And(LessThan(j, llen), Or(EqualTo(GetByte(line, j), 32), EqualTo(GetByte(line, j), 9))) {
+            j = Add(j, 1)
+        }
+        mod_buf = Allocate(512)
+
+        // C/C++: #include "X" or #include <X>
+        is_c = 0
+        IfCondition EqualTo(StringCompare(ext, ".c"), 0)    ThenBlock: { is_c = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".cpp"), 0)  ThenBlock: { is_c = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".cc"), 0)   ThenBlock: { is_c = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".h"), 0)    ThenBlock: { is_c = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".hpp"), 0)  ThenBlock: { is_c = 1 }
+        IfCondition EqualTo(is_c, 1) ThenBlock: {
+            IfCondition EqualTo(GetByte(line, j), 35) ThenBlock: {
+                // starts with #
+                k = Add(j, 1)
+                WhileLoop And(LessThan(k, llen), Or(EqualTo(GetByte(line, k), 32), EqualTo(GetByte(line, k), 9))) { k = Add(k, 1) }
+                // check "include"
+                ok = 1
+                inc = "include"
+                ilen = 7
+                m = 0
+                WhileLoop LessThan(m, ilen) {
+                    IfCondition NotEqual(GetByte(line, Add(k, m)), GetByte(inc, m)) ThenBlock: { ok = 0 }
+                    m = Add(m, 1)
+                }
+                IfCondition EqualTo(ok, 1) ThenBlock: {
+                    rest = Add(line, Add(k, ilen))
+                    mlen = Import_ExtractModule(rest, mod_buf, 511)
+                    IfCondition GreaterThan(mlen, 0) ThenBlock: {
+                        Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                    }
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // Python: "import X" / "from X import Y"
+        IfCondition EqualTo(StringCompare(ext, ".py"), 0) ThenBlock: {
+            // "import X"
+            imp = "import "
+            imp_len = 7
+            match = 1
+            m = 0
+            WhileLoop LessThan(m, imp_len) {
+                IfCondition NotEqual(GetByte(line, Add(j, m)), GetByte(imp, m)) ThenBlock: { match = 0 }
+                m = Add(m, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                rest = Add(line, Add(j, imp_len))
+                mlen = Import_ExtractModule(rest, mod_buf, 511)
+                IfCondition GreaterThan(mlen, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            // "from X import"
+            frm = "from "
+            frm_len = 5
+            match2 = 1
+            m2 = 0
+            WhileLoop LessThan(m2, frm_len) {
+                IfCondition NotEqual(GetByte(line, Add(j, m2)), GetByte(frm, m2)) ThenBlock: { match2 = 0 }
+                m2 = Add(m2, 1)
+            }
+            IfCondition EqualTo(match2, 1) ThenBlock: {
+                rest2 = Add(line, Add(j, frm_len))
+                mlen2 = Import_ExtractModule(rest2, mod_buf, 511)
+                IfCondition GreaterThan(mlen2, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // JavaScript/TypeScript: "import ... from 'X'" or simple "import 'X'"
+        is_js = 0
+        IfCondition EqualTo(StringCompare(ext, ".js"), 0)  ThenBlock: { is_js = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".ts"), 0)  ThenBlock: { is_js = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".jsx"), 0) ThenBlock: { is_js = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".tsx"), 0) ThenBlock: { is_js = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".mjs"), 0) ThenBlock: { is_js = 1 }
+        IfCondition EqualTo(is_js, 1) ThenBlock: {
+            // scan for "from '" or 'from "' anywhere in line
+            frm2 = "from "
+            fi = j
+            found_from = 0
+            WhileLoop LessThan(fi, Subtract(llen, 5)) {
+                ok2 = 1
+                mm = 0
+                WhileLoop LessThan(mm, 5) {
+                    IfCondition NotEqual(GetByte(line, Add(fi, mm)), GetByte(frm2, mm)) ThenBlock: { ok2 = 0 }
+                    mm = Add(mm, 1)
+                }
+                IfCondition EqualTo(ok2, 1) ThenBlock: {
+                    rest3 = Add(line, Add(fi, 5))
+                    mlen3 = Import_ExtractModule(rest3, mod_buf, 511)
+                    IfCondition GreaterThan(mlen3, 0) ThenBlock: {
+                        Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                        found_from = 1
+                    }
+                    fi = llen
+                }
+                fi = Add(fi, 1)
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // Rust: "use X::Y" or "use X;"
+        IfCondition EqualTo(StringCompare(ext, ".rs"), 0) ThenBlock: {
+            us = "use "
+            us_len = 4
+            match3 = 1
+            m3 = 0
+            WhileLoop LessThan(m3, us_len) {
+                IfCondition NotEqual(GetByte(line, Add(j, m3)), GetByte(us, m3)) ThenBlock: { match3 = 0 }
+                m3 = Add(m3, 1)
+            }
+            IfCondition EqualTo(match3, 1) ThenBlock: {
+                rest4 = Add(line, Add(j, us_len))
+                mlen4 = Import_ExtractModule(rest4, mod_buf, 511)
+                IfCondition GreaterThan(mlen4, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // Go: import "X"  (single or in import block)
+        IfCondition EqualTo(StringCompare(ext, ".go"), 0) ThenBlock: {
+            // look for a quoted string after optional whitespace
+            qi = j
+            WhileLoop And(LessThan(qi, llen), NotEqual(GetByte(line, qi), 34)) { qi = Add(qi, 1) }
+            IfCondition LessThan(qi, llen) ThenBlock: {
+                rest5 = Add(line, qi)
+                mlen5 = Import_ExtractModule(rest5, mod_buf, 511)
+                IfCondition GreaterThan(mlen5, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // Java/Kotlin: "import X.Y.Z"
+        is_java = 0
+        IfCondition EqualTo(StringCompare(ext, ".java"), 0)   ThenBlock: { is_java = 1 }
+        IfCondition EqualTo(StringCompare(ext, ".kt"), 0)     ThenBlock: { is_java = 1 }
+        IfCondition EqualTo(is_java, 1) ThenBlock: {
+            imp2 = "import "
+            il2 = 7
+            match4 = 1
+            m4 = 0
+            WhileLoop LessThan(m4, il2) {
+                IfCondition NotEqual(GetByte(line, Add(j, m4)), GetByte(imp2, m4)) ThenBlock: { match4 = 0 }
+                m4 = Add(m4, 1)
+            }
+            IfCondition EqualTo(match4, 1) ThenBlock: {
+                rest6 = Add(line, Add(j, il2))
+                mlen6 = Import_ExtractModule(rest6, mod_buf, 511)
+                IfCondition GreaterThan(mlen6, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        // AILang: "Import.X.Y" or "LibraryImport.X"
+        IfCondition EqualTo(StringCompare(ext, ".ailang"), 0) ThenBlock: {
+            imp3 = "Import."
+            il3 = 7
+            match5 = 1
+            m5 = 0
+            WhileLoop LessThan(m5, il3) {
+                IfCondition NotEqual(GetByte(line, Add(j, m5)), GetByte(imp3, m5)) ThenBlock: { match5 = 0 }
+                m5 = Add(m5, 1)
+            }
+            IfCondition EqualTo(match5, 1) ThenBlock: {
+                rest7 = Add(line, Add(j, il3))
+                mlen7 = Import_ExtractModule(rest7, mod_buf, 511)
+                IfCondition GreaterThan(mlen7, 0) ThenBlock: {
+                    Rel_InsertEdge(file_id, file_rel, mod_buf, "imports")
+                }
+            }
+            Deallocate(mod_buf, 512)
+            ReturnValue(0)
+        }
+
+        Deallocate(mod_buf, 512)
+    }
+}
+
+// Scan entire file content for import lines; insert kind='imports' edges.
+Function.Import_Scan {
+    Input: content: Address
+    Input: ext: Address
+    Input: file_id: Integer
+    Input: file_rel: Address
+    Body: {
+        clen = StringLength(content)
+        i = 0
+        line_start = 0
+        WhileLoop LessThan(i, clen) {
+            ch = GetByte(content, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                llen = Subtract(i, line_start)
+                IfCondition GreaterThan(llen, 3) ThenBlock: {
+                    saved2 = GetByte(content, i)
+                    SetByte(content, i, 0)
+                    Import_ScanOneLine(Add(content, line_start), llen, ext, file_rel, file_id)
+                    SetByte(content, i, saved2)
+                }
+                line_start = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+
+// =============================================================================
+// OP HANDLERS — all return a content string or 0 + err_buf on error.
+// =============================================================================
+
+// =============================================================================
+// AILANG BUILTIN FILTER — call-graph noise we don't record as edges.
+// Mirrors AILANG_BUILTINS from tools/relmem.py.
+// =============================================================================
+Function.Builtins_Add {
+    Input: name: Address
+    Body: { SHash.Insert(Builtins.table, name, 1) }
+}
+
+SubRoutine.Builtins_Init {
+    Builtins.table = SHash.Create(128)
+    // arithmetic / logic
+    Builtins_Add("Add")  Builtins_Add("Subtract")  Builtins_Add("Multiply")
+    Builtins_Add("Divide")  Builtins_Add("Modulo")  Builtins_Add("Power")
+    Builtins_Add("Negate")  Builtins_Add("Increment")  Builtins_Add("Decrement")
+    Builtins_Add("AbsoluteValue")  Builtins_Add("SquareRoot")
+    Builtins_Add("Minimum")  Builtins_Add("Maximum")
+    Builtins_Add("And")  Builtins_Add("Or")  Builtins_Add("Not")  Builtins_Add("Xor")
+    Builtins_Add("BitwiseAnd")  Builtins_Add("BitwiseOr")  Builtins_Add("BitwiseXor")
+    Builtins_Add("BitwiseNot")  Builtins_Add("LeftShift")  Builtins_Add("RightShift")
+    // comparison
+    Builtins_Add("EqualTo")  Builtins_Add("NotEqual")
+    Builtins_Add("GreaterThan")  Builtins_Add("LessThan")
+    Builtins_Add("GreaterEqual")  Builtins_Add("LessEqual")
+    // control flow
+    Builtins_Add("IfCondition")  Builtins_Add("ThenBlock")  Builtins_Add("ElseBlock")
+    Builtins_Add("WhileLoop")  Builtins_Add("ForEvery")
+    Builtins_Add("BreakLoop")  Builtins_Add("ContinueLoop")  Builtins_Add("ReturnValue")
+    Builtins_Add("Branch")  Builtins_Add("Case")  Builtins_Add("Default")
+    Builtins_Add("RunTask")  Builtins_Add("HaltProgram")
+    Builtins_Add("TryBlock")  Builtins_Add("CatchError")  Builtins_Add("FinallyBlock")
+    // memory / data
+    Builtins_Add("Allocate")  Builtins_Add("Deallocate")
+    Builtins_Add("GetByte")  Builtins_Add("SetByte")
+    Builtins_Add("Dereference")  Builtins_Add("StoreValue")
+    Builtins_Add("AddressOf")  Builtins_Add("SizeOf")
+    Builtins_Add("MemoryCopy")  Builtins_Add("MemorySet")
+    // i/o
+    Builtins_Add("PrintMessage")  Builtins_Add("PrintNumber")
+    Builtins_Add("PrintChar")  Builtins_Add("PrintString")
+    Builtins_Add("ReadInput")  Builtins_Add("ReadInputNumber")
+    Builtins_Add("SystemCall")
+    // arrays
+    Builtins_Add("ArrayCreate")  Builtins_Add("ArrayDestroy")
+    Builtins_Add("ArrayGet")  Builtins_Add("ArraySet")  Builtins_Add("ArraySize")
+    // strings
+    Builtins_Add("StringLength")  Builtins_Add("StringCompare")
+    Builtins_Add("StringConcat")  Builtins_Add("StringEquals")
+    Builtins_Add("StringSubstring")  Builtins_Add("StringCharAt")
+    Builtins_Add("NumberToString")  Builtins_Add("StringToInt")
+    Builtins_Add("StringToNumber")
+    // debug
+    Builtins_Add("DebugAssert")  Builtins_Add("DebugTrace")
+    Builtins_Add("DebugBreak")  Builtins_Add("DebugMemory")
+    Builtins_Add("DebugPerf")  Builtins_Add("DebugInspect")
+    // atomic
+    Builtins_Add("AtomicCompareSwap")  Builtins_Add("AtomicAdd")
+    Builtins_Add("AtomicLoad")  Builtins_Add("AtomicStore")
+}
+
+Function.Builtins_Has {
+    Input: name: Address
+    Output: Integer
+    Body: { ReturnValue(SHash.Exists(Builtins.table, name)) }
+}
+
+
+// =============================================================================
+// PARSER UTILITIES
+// =============================================================================
+
+// Lowercase `len` bytes from `src` into `dst` (must hold len+1 bytes).
+Function.Str_LowerN {
+    Input: src: Address
+    Input: src_off: Integer
+    Input: len: Integer
+    Input: dst: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(src, Add(src_off, i))
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                ch = Add(ch, 32)
+            }
+            SetByte(dst, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(dst, len, 0)
+    }
+}
+
+// Slice `len` bytes from `src` at offset `src_off` into `dst` (NUL-term).
+Function.Str_SliceN {
+    Input: src: Address
+    Input: src_off: Integer
+    Input: len: Integer
+    Input: dst: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(dst, i, GetByte(src, Add(src_off, i)))
+            i = Add(i, 1)
+        }
+        SetByte(dst, len, 0)
+    }
+}
+
+// True if byte ch is an identifier character (letter/digit/underscore/dot).
+// We allow '.' so AiLang dotted names like Foo.Bar.Baz read as one token.
+Function.Is_IdentByte {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 46) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.Is_IdentStart {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Build a node JSON tagged-value: { tok, cat, kind, line, edges:[] }
+//
+// JSON.SetString stores the raw pointer (no internal copy), so any
+// mailbox-backed input would alias and be overwritten by the next call.
+// We dup `tok` (typically from OpScratch.tmp) into stable memory.
+// `cat` and `kind` are expected to be string literals (".rodata") so
+// they don't need duping — pass non-literals at your peril.
+Function.Node_New {
+    Input: tok: Address
+    Input: cat: Address
+    Input: kind: Address
+    Input: line: Integer
+    Output: Address
+    Body: {
+        node = JSON.NewObject()
+        JSON.SetString(node, "tok", Str_Dup(tok))
+        JSON.SetString(node, "cat", cat)
+        JSON.SetString(node, "kind", kind)
+        JSON.SetNumber(node, "line", line)
+        edges = JSON.NewArray()
+        JSON.SetArray(node, "edges", edges)
+        ReturnValue(JSON.Tag(JType.OBJECT, node))
+    }
+}
+
+// Add a "calls" edge to a node tagged-value, deduped against existing edges.
+Function.Node_AddCall {
+    Input: node_tag: Address
+    Input: target_lc: Address
+    Body: {
+        node = JSON.AsObject(node_tag)
+        edges = JSON.GetArray(node, "edges")
+        IfCondition EqualTo(edges, 0) ThenBlock: { ReturnValue(0) }
+        // dedupe: scan existing edges for same target
+        ne = JSON.ArrayLength(edges)
+        ei = 0
+        already = 0
+        WhileLoop LessThan(ei, ne) {
+            edge_tag = JSON.ArrayGet(edges, ei)
+            edge = JSON.AsArray(edge_tag)
+            IfCondition NotEqual(edge, 0) ThenBlock: {
+                t_tag = JSON.ArrayGet(edge, 0)
+                t = JSON.AsString(t_tag)
+                IfCondition NotEqual(t, 0) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(t, target_lc), 0) ThenBlock: {
+                        already = 1
+                        ei = ne
+                    }
+                }
+            }
+            ei = Add(ei, 1)
+        }
+        IfCondition EqualTo(already, 0) ThenBlock: {
+            edge = JSON.NewArray()
+            // target_lc is typically OpScratch.tok_lc — dup before storing.
+            JSON.PushString(edge, Str_Dup(target_lc))
+            JSON.PushString(edge, "calls")
+            JSON.PushArray(edges, edge)
+        }
+    }
+}
+
+// Insert (nid_lc -> node_tag) into nodes_obj if not already present.
+Function.Nodes_AddIfMissing {
+    Input: nodes_obj: Address
+    Input: nid_lc: Address
+    Input: node_tag: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(SHash.Exists(nodes_obj, nid_lc), 1) ThenBlock: {
+            ReturnValue(SHash.Lookup(nodes_obj, nid_lc))
+        }
+        SHash.Insert(nodes_obj, nid_lc, node_tag)
+        ReturnValue(node_tag)
+    }
+}
+
+
+// ASCII lowercase of `s` written into PathScratch.buf_a. Returns the
+// scratch buffer pointer (caller must consume before next call).
+Function.Str_LowerInto {
+    Input: s: Address
+    Input: dst: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: {
+            SetByte(dst, 0, 0)
+            ReturnValue(dst)
+        }
+        slen = StringLength(s)
+        IfCondition GreaterThan(slen, Subtract(PathScratch.cap, 1)) ThenBlock: {
+            slen = Subtract(PathScratch.cap, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, slen) {
+            ch = GetByte(s, i)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                ch = Add(ch, 32)
+            }
+            SetByte(dst, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(dst, slen, 0)
+        ReturnValue(dst)
+    }
+}
+
+
+// =============================================================================
+// PARSERS — each takes (content, kind) and returns a JSON object of
+// { nid_lc -> Tag(OBJECT, node) }. nid_lc is the lowercased identifier.
+// =============================================================================
+
+// Capitalized-token fallback. Useful for natural-language files (English,
+// Spanish, etc.) and as a last resort for unknown extensions. Caps at
+// 400 lines to stay cheap on huge text files. Mirrors relmem.py _parse_text.
+Function.Parse_Text {
+    Input: content: Address
+    Input: kind: Address
+    Output: Address
+    Body: {
+        nodes = JSON.NewObject()
+        clen = StringLength(content)
+        line_no = 1
+        i = 0
+        WhileLoop And(LessThan(i, clen), LessEqual(line_no, 400)) {
+            line_start = i
+            WhileLoop And(LessThan(i, clen), NotEqual(GetByte(content, i), 10)) {
+                i = Add(i, 1)
+            }
+            // Walk this line for capitalized tokens of length >= 3
+            j = line_start
+            WhileLoop LessThan(j, i) {
+                ch = GetByte(content, j)
+                IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                    // start of a Capitalized token — but only if not preceded by ident byte
+                    prev_ok = 1
+                    IfCondition GreaterThan(j, line_start) ThenBlock: {
+                        IfCondition EqualTo(Is_IdentByte(GetByte(content, Subtract(j, 1))), 1) ThenBlock: { prev_ok = 0 }
+                    }
+                    IfCondition EqualTo(prev_ok, 1) ThenBlock: {
+                        end = j
+                        WhileLoop And(LessThan(end, i), EqualTo(Is_IdentByte(GetByte(content, end)), 1)) {
+                            end = Add(end, 1)
+                        }
+                        toklen = Subtract(end, j)
+                        IfCondition GreaterEqual(toklen, 3) ThenBlock: {
+                            IfCondition LessThan(toklen, OpScratch.cap) ThenBlock: {
+                                Str_SliceN(content, j, toklen, OpScratch.tmp)
+                                Str_LowerN(content, j, toklen, OpScratch.tok_lc)
+                                IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 0) ThenBlock: {
+                                    nt = Node_New(OpScratch.tmp, "symbol", kind, line_no)
+                                    SHash.Insert(nodes, OpScratch.tok_lc, nt)
+                                }
+                            }
+                        }
+                        j = end
+                    }
+                }
+                j = Add(j, 1)
+            }
+            line_no = Add(line_no, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(nodes)
+    }
+}
+
+// Markdown: # / ## / ### headers.
+Function.Parse_Markdown {
+    Input: content: Address
+    Input: kind: Address
+    Output: Address
+    Body: {
+        nodes = JSON.NewObject()
+        clen = StringLength(content)
+        line_no = 1
+        i = 0
+        WhileLoop LessThan(i, clen) {
+            line_start = i
+            WhileLoop And(LessThan(i, clen), NotEqual(GetByte(content, i), 10)) {
+                i = Add(i, 1)
+            }
+            // count leading '#'
+            j = line_start
+            level = 0
+            WhileLoop And(LessThan(j, i), EqualTo(GetByte(content, j), 35)) {
+                level = Add(level, 1)
+                j = Add(j, 1)
+            }
+            IfCondition And(GreaterThan(level, 0), LessEqual(level, 6)) ThenBlock: {
+                IfCondition And(LessThan(j, i), EqualTo(GetByte(content, j), 32)) ThenBlock: {
+                    j = Add(j, 1)
+                    title_start = j
+                    title_len = Subtract(i, title_start)
+                    IfCondition GreaterThan(title_len, 80) ThenBlock: { title_len = 80 }
+                    IfCondition GreaterThan(title_len, 0) ThenBlock: {
+                        Str_SliceN(content, title_start, title_len, OpScratch.tmp)
+                        // nid = "h_<sanitized lowercased title>"
+                        SetByte(OpScratch.tok_lc, 0, 104)   // h
+                        SetByte(OpScratch.tok_lc, 1, 95)    // _
+                        out_pos = 2
+                        k = 0
+                        WhileLoop And(LessThan(k, title_len), LessThan(out_pos, 60)) {
+                            ch = GetByte(OpScratch.tmp, k)
+                            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ch = Add(ch, 32) }
+                            IfCondition EqualTo(Is_IdentByte(ch), 1) ThenBlock: {
+                                SetByte(OpScratch.tok_lc, out_pos, ch)
+                                out_pos = Add(out_pos, 1)
+                            } ElseBlock: {
+                                IfCondition GreaterThan(out_pos, 2) ThenBlock: {
+                                    IfCondition NotEqual(GetByte(OpScratch.tok_lc, Subtract(out_pos, 1)), 95) ThenBlock: {
+                                        SetByte(OpScratch.tok_lc, out_pos, 95)
+                                        out_pos = Add(out_pos, 1)
+                                    }
+                                }
+                            }
+                            k = Add(k, 1)
+                        }
+                        SetByte(OpScratch.tok_lc, out_pos, 0)
+                        // "h1".."h6" — index into pre-allocated slab, no Arena growth.
+                        cat_buf = Add(HeadingCats.slab, Multiply(Subtract(level, 1), 3))
+                        IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 0) ThenBlock: {
+                            nt = Node_New(OpScratch.tmp, cat_buf, kind, line_no)
+                            SHash.Insert(nodes, OpScratch.tok_lc, nt)
+                        }
+                    }
+                }
+            }
+            line_no = Add(line_no, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(nodes)
+    }
+}
+
+// Shell: `name() {` and `function name`.
+Function.Parse_Shell {
+    Input: content: Address
+    Input: kind: Address
+    Output: Address
+    Body: {
+        nodes = JSON.NewObject()
+        clen = StringLength(content)
+        line_no = 1
+        i = 0
+        WhileLoop LessThan(i, clen) {
+            line_start = i
+            WhileLoop And(LessThan(i, clen), NotEqual(GetByte(content, i), 10)) {
+                i = Add(i, 1)
+            }
+            // skip leading whitespace
+            j = line_start
+            WhileLoop And(LessThan(j, i), Or(EqualTo(GetByte(content, j), 32), EqualTo(GetByte(content, j), 9))) {
+                j = Add(j, 1)
+            }
+            name_start = -1
+            name_end = -1
+            // Try "function NAME"
+            IfCondition And(LessThan(Add(j, 9), i), EqualTo(GetByte(content, j), 102)) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 1)), 117) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 2)), 110) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 3)), 99) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 4)), 116) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 5)), 105) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 6)), 111) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 7)), 110) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 8)), 32) ThenBlock: {
+                    s = Add(j, 9)
+                    e = s
+                    WhileLoop And(LessThan(e, i), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+                        e = Add(e, 1)
+                    }
+                    IfCondition GreaterThan(e, s) ThenBlock: {
+                        name_start = s
+                        name_end = e
+                    }
+                }}}}}}}}
+            }
+            // Try "NAME() {"
+            IfCondition LessThan(name_start, 0) ThenBlock: {
+                IfCondition EqualTo(Is_IdentStart(GetByte(content, j)), 1) ThenBlock: {
+                    e = j
+                    WhileLoop And(LessThan(e, i), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+                        e = Add(e, 1)
+                    }
+                    // expect "(" then ")" optionally with spaces, then "{"
+                    IfCondition And(LessThan(e, i), EqualTo(GetByte(content, e), 40)) ThenBlock: {
+                        p = Add(e, 1)
+                        WhileLoop And(LessThan(p, i), EqualTo(GetByte(content, p), 32)) { p = Add(p, 1) }
+                        IfCondition And(LessThan(p, i), EqualTo(GetByte(content, p), 41)) ThenBlock: {
+                            name_start = j
+                            name_end = e
+                        }
+                    }
+                }
+            }
+            IfCondition GreaterEqual(name_start, 0) ThenBlock: {
+                nlen = Subtract(name_end, name_start)
+                IfCondition LessThan(nlen, OpScratch.cap) ThenBlock: {
+                    Str_SliceN(content, name_start, nlen, OpScratch.tmp)
+                    Str_LowerN(content, name_start, nlen, OpScratch.tok_lc)
+                    IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 0) ThenBlock: {
+                        nt = Node_New(OpScratch.tmp, "function", kind, line_no)
+                        SHash.Insert(nodes, OpScratch.tok_lc, nt)
+                    }
+                }
+            }
+            line_no = Add(line_no, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(nodes)
+    }
+}
+
+// Python: heuristic regex-style detection for `def`, `class`,
+// `import X`, `from X import`. AiLang has no Python ast bindings, so we
+// can't reproduce relmem.py's full call-graph extraction — just defs.
+Function.Parse_Python {
+    Input: content: Address
+    Input: kind: Address
+    Output: Address
+    Body: {
+        nodes = JSON.NewObject()
+        clen = StringLength(content)
+        line_no = 1
+        i = 0
+        WhileLoop LessThan(i, clen) {
+            line_start = i
+            WhileLoop And(LessThan(i, clen), NotEqual(GetByte(content, i), 10)) {
+                i = Add(i, 1)
+            }
+            j = line_start
+            WhileLoop And(LessThan(j, i), Or(EqualTo(GetByte(content, j), 32), EqualTo(GetByte(content, j), 9))) {
+                j = Add(j, 1)
+            }
+            cat = 0
+            id_start = -1
+            // def NAME(
+            IfCondition And(LessThan(Add(j, 4), i), EqualTo(GetByte(content, j), 100)) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 1)), 101) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 2)), 102) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(j, 3)), 32) ThenBlock: {
+                    cat = "function"
+                    id_start = Add(j, 4)
+                }}}
+            }
+            // class NAME
+            IfCondition LessThan(id_start, 0) ThenBlock: {
+                IfCondition And(LessThan(Add(j, 6), i), EqualTo(GetByte(content, j), 99)) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 1)), 108) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 2)), 97) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 3)), 115) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 4)), 115) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 5)), 32) ThenBlock: {
+                        cat = "class"
+                        id_start = Add(j, 6)
+                    }}}}}
+                }
+            }
+            // import NAME
+            IfCondition LessThan(id_start, 0) ThenBlock: {
+                IfCondition And(LessThan(Add(j, 7), i), EqualTo(GetByte(content, j), 105)) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 1)), 109) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 2)), 112) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 3)), 111) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 4)), 114) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 5)), 116) ThenBlock: {
+                    IfCondition EqualTo(GetByte(content, Add(j, 6)), 32) ThenBlock: {
+                        cat = "import"
+                        id_start = Add(j, 7)
+                    }}}}}}
+                }
+            }
+            IfCondition GreaterEqual(id_start, 0) ThenBlock: {
+                e = id_start
+                WhileLoop And(LessThan(e, i), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+                    e = Add(e, 1)
+                }
+                nlen = Subtract(e, id_start)
+                IfCondition And(GreaterThan(nlen, 0), LessThan(nlen, OpScratch.cap)) ThenBlock: {
+                    Str_SliceN(content, id_start, nlen, OpScratch.tmp)
+                    // For imports, prefix "import_" to mirror relmem.py
+                    IfCondition EqualTo(StringCompare(cat, "import"), 0) ThenBlock: {
+                        SetByte(OpScratch.tok_lc, 0, 105)
+                        SetByte(OpScratch.tok_lc, 1, 109)
+                        SetByte(OpScratch.tok_lc, 2, 112)
+                        SetByte(OpScratch.tok_lc, 3, 111)
+                        SetByte(OpScratch.tok_lc, 4, 114)
+                        SetByte(OpScratch.tok_lc, 5, 116)
+                        SetByte(OpScratch.tok_lc, 6, 95)
+                        ki = 0
+                        WhileLoop LessThan(ki, nlen) {
+                            ch = GetByte(content, Add(id_start, ki))
+                            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ch = Add(ch, 32) }
+                            SetByte(OpScratch.tok_lc, Add(7, ki), ch)
+                            ki = Add(ki, 1)
+                        }
+                        SetByte(OpScratch.tok_lc, Add(7, nlen), 0)
+                    } ElseBlock: {
+                        Str_LowerN(content, id_start, nlen, OpScratch.tok_lc)
+                    }
+                    IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 0) ThenBlock: {
+                        nt = Node_New(OpScratch.tmp, cat, kind, line_no)
+                        SHash.Insert(nodes, OpScratch.tok_lc, nt)
+                    }
+                }
+            }
+            line_no = Add(line_no, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(nodes)
+    }
+}
+
+// AiLang: declarations + call edges. Mirrors relmem.py _parse_ailang.
+//
+// Detect at brace-depth 0:
+//   Function./SubRoutine./Combinator./Lambda./MacroBlock./<Pool>.<name>
+//   LibraryImport.<dotted.name>
+// Inside a function body, capture CapitalizedName(... call sites and
+// record them as edges on the enclosing function (filtered by Builtins_Has).
+//
+// Brace counting is done on the original line so that a trailing `//`
+// comment with stray braces in it doesn't perturb depth — comments are
+// rare and stripping them risks dropping a real `}`.
+Function.Parse_AILang {
+    Input: content: Address
+    Input: kind: Address
+    Output: Address
+    Body: {
+        nodes = JSON.NewObject()
+        clen = StringLength(content)
+        line_no = 1
+        depth = 0
+        cur_fn_lc = 0
+        cur_fn_tag = 0
+        i = 0
+        WhileLoop LessThan(i, clen) {
+            line_start = i
+            WhileLoop And(LessThan(i, clen), NotEqual(GetByte(content, i), 10)) {
+                i = Add(i, 1)
+            }
+            // skip leading whitespace
+            j = line_start
+            WhileLoop And(LessThan(j, i), Or(EqualTo(GetByte(content, j), 32), EqualTo(GetByte(content, j), 9))) {
+                j = Add(j, 1)
+            }
+            // Top-level decl detection at depth 0.
+            IfCondition EqualTo(depth, 0) ThenBlock: {
+                cur_fn_tag = AILang_TryDecl(content, j, i, line_no, nodes)
+                IfCondition NotEqual(cur_fn_tag, 0) ThenBlock: {
+                    cur_fn_lc = AILang_LastFnNid()
+                }
+            }
+            // Scan calls on every line we have a current function for —
+            // including the decl line itself, so single-line functions
+            // like `Function.Foo { Body: { Bar() } }` capture the edge.
+            IfCondition NotEqual(cur_fn_tag, 0) ThenBlock: {
+                AILang_ScanCalls(content, line_start, i, cur_fn_tag)
+            }
+            // Update brace depth on the ORIGINAL line bytes.
+            k = line_start
+            WhileLoop LessThan(k, i) {
+                ch = GetByte(content, k)
+                IfCondition EqualTo(ch, 123) ThenBlock: { depth = Add(depth, 1) }
+                IfCondition EqualTo(ch, 125) ThenBlock: { depth = Subtract(depth, 1) }
+                k = Add(k, 1)
+            }
+            IfCondition LessThan(depth, 0) ThenBlock: { depth = 0 }
+            // If we just left the current function's body, clear it.
+            IfCondition And(NotEqual(cur_fn_tag, 0), EqualTo(depth, 0)) ThenBlock: {
+                cur_fn_tag = 0
+            }
+            line_no = Add(line_no, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(nodes)
+    }
+}
+
+// AILang_LastFnNid stores the last function's nid_lc into a stable
+// FixedPool slot so Parse_AILang can hold onto it across iterations.
+FixedPool.AILangParse {
+    "last_fn_nid":  Initialize=0, CanChange=True
+}
+
+Function.AILang_LastFnNid {
+    Output: Address
+    Body: { ReturnValue(AILangParse.last_fn_nid) }
+}
+
+// Match top-level Function./SubRoutine./<Pool>./LibraryImport. on the
+// line spanning content[j..end_excl]. On a function-style decl, returns
+// the node tag (so caller knows we're entering a function body) AND
+// stashes the lowercased nid into AILangParse.last_fn_nid via Str_Dup.
+// On a pool/import decl, registers a node and returns 0 (no body).
+Function.AILang_TryDecl {
+    Input: content: Address
+    Input: j: Integer
+    Input: end_excl: Integer
+    Input: line_no: Integer
+    Input: nodes: Address
+    Output: Address
+    Body: {
+        // Function./SubRoutine./Combinator./Lambda./MacroBlock.
+        is_fn = 0
+        skip = 0
+        IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "Function."), 1) ThenBlock: {
+            is_fn = 1  skip = 9
+        }
+        IfCondition EqualTo(is_fn, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "SubRoutine."), 1) ThenBlock: {
+                is_fn = 1  skip = 11
+            }
+        }
+        IfCondition EqualTo(is_fn, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "Combinator."), 1) ThenBlock: {
+                is_fn = 1  skip = 11
+            }
+        }
+        IfCondition EqualTo(is_fn, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "Lambda."), 1) ThenBlock: {
+                is_fn = 1  skip = 7
+            }
+        }
+        IfCondition EqualTo(is_fn, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "MacroBlock."), 1) ThenBlock: {
+                is_fn = 1  skip = 11
+            }
+        }
+        IfCondition EqualTo(is_fn, 1) ThenBlock: {
+            ReturnValue(AILang_RegisterDecl(content, Add(j, skip), end_excl, line_no, "function", nodes))
+        }
+
+        // Pool decls: FixedPool / DynamicPool / TemporalPool / NeuralPool /
+        // KernelPool / ActorPool / SecurityPool / ConstrainedPool /
+        // FilePool / LinkagePool / SubPool
+        is_pool = 0  pskip = 0
+        IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "FixedPool."), 1) ThenBlock: { is_pool = 1  pskip = 10 }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "DynamicPool."), 1) ThenBlock: { is_pool = 1  pskip = 12 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "TemporalPool."), 1) ThenBlock: { is_pool = 1  pskip = 13 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "NeuralPool."), 1) ThenBlock: { is_pool = 1  pskip = 11 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "KernelPool."), 1) ThenBlock: { is_pool = 1  pskip = 11 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "ActorPool."), 1) ThenBlock: { is_pool = 1  pskip = 10 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "SecurityPool."), 1) ThenBlock: { is_pool = 1  pskip = 13 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "ConstrainedPool."), 1) ThenBlock: { is_pool = 1  pskip = 16 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "FilePool."), 1) ThenBlock: { is_pool = 1  pskip = 9 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "LinkagePool."), 1) ThenBlock: { is_pool = 1  pskip = 12 }
+        }
+        IfCondition EqualTo(is_pool, 0) ThenBlock: {
+            IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "SubPool."), 1) ThenBlock: { is_pool = 1  pskip = 8 }
+        }
+        IfCondition EqualTo(is_pool, 1) ThenBlock: {
+            AILang_RegisterDecl(content, Add(j, pskip), end_excl, line_no, "pool", nodes)
+            ReturnValue(0)
+        }
+
+        // LibraryImport.<name>
+        IfCondition EqualTo(AILang_LineStartsWith(content, j, end_excl, "LibraryImport."), 1) ThenBlock: {
+            AILang_RegisterImport(content, Add(j, 14), end_excl, line_no, nodes)
+            ReturnValue(0)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.AILang_LineStartsWith {
+    Input: content: Address
+    Input: j: Integer
+    Input: end_excl: Integer
+    Input: prefix: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(prefix)
+        IfCondition GreaterThan(Add(j, plen), end_excl) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition NotEqual(GetByte(content, Add(j, i)), GetByte(prefix, i)) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Read an ident starting at `start`, register a node, and (for cat=="function")
+// stash the lowercased nid into AILangParse.last_fn_nid + return the node tag
+// so the caller can hang call edges off it. Pool/import decls return 0
+// because their bodies don't accumulate edges.
+//
+// 6-arg cap: encoding the "this is a function decl" signal via cat itself
+// rather than a 7th boolean param.
+Function.AILang_RegisterDecl {
+    Input: content: Address
+    Input: start: Integer
+    Input: end_excl: Integer
+    Input: line_no: Integer
+    Input: cat: Address
+    Input: nodes: Address
+    Output: Address
+    Body: {
+        e = start
+        WhileLoop And(LessThan(e, end_excl), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+            e = Add(e, 1)
+        }
+        nlen = Subtract(e, start)
+        IfCondition EqualTo(nlen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(nlen, OpScratch.cap) ThenBlock: { ReturnValue(0) }
+        Str_SliceN(content, start, nlen, OpScratch.tmp)
+        Str_LowerN(content, start, nlen, OpScratch.tok_lc)
+        is_fn = EqualTo(StringCompare(cat, "function"), 0)
+
+        IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 1) ThenBlock: {
+            existing = SHash.Lookup(nodes, OpScratch.tok_lc)
+            IfCondition EqualTo(is_fn, 1) ThenBlock: {
+                AILangParse.last_fn_nid = Str_Dup(OpScratch.tok_lc)
+                ReturnValue(existing)
+            }
+            ReturnValue(0)
+        }
+        nt = Node_New(OpScratch.tmp, cat, "ailang", line_no)
+        SHash.Insert(nodes, OpScratch.tok_lc, nt)
+        IfCondition EqualTo(is_fn, 1) ThenBlock: {
+            AILangParse.last_fn_nid = Str_Dup(OpScratch.tok_lc)
+            ReturnValue(nt)
+        }
+        ReturnValue(0)
+    }
+}
+
+// LibraryImport.foo.bar.baz → register node "import_<lowered.name>".
+Function.AILang_RegisterImport {
+    Input: content: Address
+    Input: start: Integer
+    Input: end_excl: Integer
+    Input: line_no: Integer
+    Input: nodes: Address
+    Body: {
+        e = start
+        WhileLoop And(LessThan(e, end_excl), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+            e = Add(e, 1)
+        }
+        nlen = Subtract(e, start)
+        IfCondition EqualTo(nlen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(nlen, Subtract(OpScratch.cap, 8)) ThenBlock: { ReturnValue(0) }
+        Str_SliceN(content, start, nlen, OpScratch.tmp)
+        // tok_lc = "import_" + lower(name)
+        SetByte(OpScratch.tok_lc, 0, 105)
+        SetByte(OpScratch.tok_lc, 1, 109)
+        SetByte(OpScratch.tok_lc, 2, 112)
+        SetByte(OpScratch.tok_lc, 3, 111)
+        SetByte(OpScratch.tok_lc, 4, 114)
+        SetByte(OpScratch.tok_lc, 5, 116)
+        SetByte(OpScratch.tok_lc, 6, 95)
+        ki = 0
+        WhileLoop LessThan(ki, nlen) {
+            ch = GetByte(content, Add(start, ki))
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ch = Add(ch, 32) }
+            SetByte(OpScratch.tok_lc, Add(7, ki), ch)
+            ki = Add(ki, 1)
+        }
+        SetByte(OpScratch.tok_lc, Add(7, nlen), 0)
+        IfCondition EqualTo(SHash.Exists(nodes, OpScratch.tok_lc), 0) ThenBlock: {
+            nt = Node_New(OpScratch.tmp, "import", "ailang", line_no)
+            SHash.Insert(nodes, OpScratch.tok_lc, nt)
+        }
+    }
+}
+
+// Walk one line for CapitalizedName(... call sites; add each as a "calls"
+// edge on cur_fn_tag (deduped). Skips control-flow / I/O builtins.
+Function.AILang_ScanCalls {
+    Input: content: Address
+    Input: line_start: Integer
+    Input: end_excl: Integer
+    Input: cur_fn_tag: Address
+    Body: {
+        // Strip a trailing "//" comment by scanning for it.
+        cmt = AILang_FindLineComment(content, line_start, end_excl)
+        scan_end = end_excl
+        IfCondition GreaterEqual(cmt, 0) ThenBlock: { scan_end = cmt }
+        j = line_start
+        WhileLoop LessThan(j, scan_end) {
+            ch = GetByte(content, j)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                prev_ok = 1
+                IfCondition GreaterThan(j, line_start) ThenBlock: {
+                    IfCondition EqualTo(Is_IdentByte(GetByte(content, Subtract(j, 1))), 1) ThenBlock: { prev_ok = 0 }
+                }
+                IfCondition EqualTo(prev_ok, 1) ThenBlock: {
+                    e = j
+                    WhileLoop And(LessThan(e, scan_end), EqualTo(Is_IdentByte(GetByte(content, e)), 1)) {
+                        e = Add(e, 1)
+                    }
+                    // must be followed (after optional spaces) by `(`
+                    p = e
+                    WhileLoop And(LessThan(p, scan_end), EqualTo(GetByte(content, p), 32)) { p = Add(p, 1) }
+                    IfCondition And(LessThan(p, scan_end), EqualTo(GetByte(content, p), 40)) ThenBlock: {
+                        nlen = Subtract(e, j)
+                        IfCondition LessThan(nlen, OpScratch.cap) ThenBlock: {
+                            // strip dotted prefix: "Foo.Bar.Baz" → "Baz"
+                            seg_start = j
+                            di = j
+                            WhileLoop LessThan(di, e) {
+                                IfCondition EqualTo(GetByte(content, di), 46) ThenBlock: { seg_start = Add(di, 1) }
+                                di = Add(di, 1)
+                            }
+                            seg_len = Subtract(e, seg_start)
+                            IfCondition GreaterThan(seg_len, 0) ThenBlock: {
+                                Str_SliceN(content, seg_start, seg_len, OpScratch.tmp)
+                                IfCondition EqualTo(Builtins_Has(OpScratch.tmp), 0) ThenBlock: {
+                                    Str_LowerN(content, seg_start, seg_len, OpScratch.tok_lc)
+                                    Node_AddCall(cur_fn_tag, OpScratch.tok_lc)
+                                }
+                            }
+                        }
+                        j = e
+                    } ElseBlock: {
+                        j = e
+                    }
+                }
+            }
+            j = Add(j, 1)
+        }
+    }
+}
+
+// Return the byte offset of "//" inside [start, end_excl), or -1.
+Function.AILang_FindLineComment {
+    Input: content: Address
+    Input: start: Integer
+    Input: end_excl: Integer
+    Output: Integer
+    Body: {
+        i = start
+        last = Subtract(end_excl, 1)
+        WhileLoop LessThan(i, last) {
+            IfCondition EqualTo(GetByte(content, i), 47) ThenBlock: {
+                IfCondition EqualTo(GetByte(content, Add(i, 1)), 47) ThenBlock: { ReturnValue(i) }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+
+// =============================================================================
+// PARSER DISPATCH — extension → parser, with kind tag.
+// =============================================================================
+Function.Parser_Dispatch {
+    Input: ext: Address
+    Input: content: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(StringCompare(ext, ".ailang"), 0) ThenBlock: { ReturnValue(Parse_AILang(content, "ailang")) }
+        IfCondition EqualTo(StringCompare(ext, ".py"), 0)     ThenBlock: { ReturnValue(Parse_Python(content, "py")) }
+        IfCondition EqualTo(StringCompare(ext, ".pyw"), 0)    ThenBlock: { ReturnValue(Parse_Python(content, "py")) }
+        IfCondition EqualTo(StringCompare(ext, ".sh"), 0)     ThenBlock: { ReturnValue(Parse_Shell(content, "shell")) }
+        IfCondition EqualTo(StringCompare(ext, ".bash"), 0)   ThenBlock: { ReturnValue(Parse_Shell(content, "shell")) }
+        IfCondition EqualTo(StringCompare(ext, ".md"), 0)     ThenBlock: { ReturnValue(Parse_Markdown(content, "md")) }
+        // C, Zig, HTML, JSON: fall through to text fallback for now.
+        // Extending to dedicated parsers is a follow-up: each becomes a
+        // sibling Parse_X function with a kind tag — registry-driven, no
+        // changes elsewhere needed.
+        ReturnValue(Parse_Text(content, "text"))
+    }
+}
+
+
+// =============================================================================
+// WALKER — recursive directory descent via getdents64.
+// =============================================================================
+
+// True if name is "."/".."/.git/etc. — a directory we never descend into.
+Function.Walker_ShouldSkipDir {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(StringCompare(name, "."), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".."), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".git"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".venv"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "venv"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "__pycache__"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "node_modules"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".claude"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".idea"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, ".vscode"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "dist"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "build"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Backups"), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// True if `path`'s extension is in the comma-list `csv` (e.g. ",ailang,py,").
+Function.Walker_ExtMatches {
+    Input: path: Address
+    Input: csv: Address
+    Output: Integer
+    Body: {
+        ext = Path_Ext(path)
+        // ext is ".foo" — strip leading dot and wrap in commas to match csv form
+        elen = StringLength(ext)
+        IfCondition LessEqual(elen, 1) ThenBlock: { ReturnValue(0) }
+        // Build ",foo," in OpScratch.tok_lc (we're not using it for nodes here)
+        SetByte(OpScratch.tok_lc, 0, 44)
+        i = 1
+        WhileLoop LessThan(i, elen) {
+            ch = GetByte(ext, i)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ch = Add(ch, 32) }
+            SetByte(OpScratch.tok_lc, i, ch)
+            i = Add(i, 1)
+        }
+        SetByte(OpScratch.tok_lc, elen, 44)
+        SetByte(OpScratch.tok_lc, Add(elen, 1), 0)
+        IfCondition GreaterEqual(StringIndexOf(csv, OpScratch.tok_lc), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Read file at Walker.path, parse, store symbols+edges in postgres.
+// Skips when mtime in DB matches current mtime (incremental).
+Function.Walker_ProcessFile {
+    Input: rel_offset: Integer
+    Body: {
+        rel_path = Add(Walker.path, rel_offset)
+        IfCondition EqualTo(Walker_ExtMatches(Walker.path, Walker.exts_csv), 0) ThenBlock: { ReturnValue(0) }
+        Walker.n_total = Add(Walker.n_total, 1)
+
+        mtime = FS_Stat(Walker.path)
+        IfCondition LessThan(mtime, 0) ThenBlock: {
+            Walker.n_failed = Add(Walker.n_failed, 1)
+            ReturnValue(0)
+        }
+        mtime_str = NumberToString(mtime)
+
+        // Incremental skip: if hash in postgres matches current mtime, nothing changed.
+        IfCondition EqualTo(Rel_FileUnchanged(Walker.path, mtime_str), 1) ThenBlock: {
+            Walker.n_skipped = Add(Walker.n_skipped, 1)
+            ReturnValue(0)
+        }
+
+        content = FS_ReadAllCapped(Walker.path, CCRelConst.MAX_CONTENT)
+        IfCondition EqualTo(content, 0) ThenBlock: {
+            Walker.n_failed = Add(Walker.n_failed, 1)
+            ReturnValue(0)
+        }
+        ext = Path_Ext(Walker.path)
+        ext_dup = Str_Dup(ext)
+
+        // Strip leading dot from ext for lang column: ".py" -> "py"
+        lang = ext_dup
+        IfCondition NotEqual(ext_dup, 0) ThenBlock: {
+            IfCondition EqualTo(GetByte(ext_dup, 0), 46) ThenBlock: {
+                lang = Add(ext_dup, 1)
+            }
+        }
+
+        // Upsert file record -> get file_id
+        file_id = Rel_UpsertFile(Walker.path, rel_path, lang, mtime_str)
+        IfCondition EqualTo(file_id, 0) ThenBlock: {
+            Deallocate(content, Add(StringLength(content), 1))
+            Walker.n_failed = Add(Walker.n_failed, 1)
+            ReturnValue(0)
+        }
+
+        // Remove stale symbols/edges for this file
+        Rel_ClearFileSymbols(file_id)
+
+        // Route: AILang uses native parser (has call-graph extraction).
+        // All other formats go through ctags if available, then import scan.
+        // Fall back to legacy Parser_Dispatch if ctags not found.
+        is_ailang = EqualTo(StringCompare(ext_dup, ".ailang"), 0)
+        used_ctags = 0
+        IfCondition And(EqualTo(is_ailang, 0), NotEqual(CtagsState.binary, 0)) ThenBlock: {
+            Ctags_IndexFile(Walker.path, file_id)
+            Import_Scan(content, ext_dup, file_id, rel_path)
+            used_ctags = 1
+        }
+
+        nodes = 0
+        IfCondition EqualTo(used_ctags, 0) ThenBlock: {
+            nodes = Parser_Dispatch(ext_dup, content)
+        }
+        Deallocate(content, Add(StringLength(content), 1))
+
+        // Insert symbols and edges from native parser (AILang or ctags fallback)
+        IfCondition NotEqual(nodes, 0) ThenBlock: {
+            node_keys = SHash.Keys(nodes)
+            nn = Array.Size(node_keys)
+            k = 0
+            WhileLoop LessThan(k, nn) {
+                nid = Array.Get(node_keys, k)
+                node_tag = SHash.Lookup(nodes, nid)
+                IfCondition NotEqual(node_tag, 0) ThenBlock: {
+                    node = JSON.AsObject(node_tag)
+                    tok  = JSON.GetString(node, "tok")
+                    cat  = JSON.GetString(node, "cat")
+                    line_no = JSON.GetNumber(node, "line")
+                    IfCondition EqualTo(tok, 0) ThenBlock: { tok = nid }
+                    IfCondition EqualTo(cat, 0) ThenBlock: { cat = "symbol" }
+                    Rel_InsertSymbol(file_id, tok, cat, line_no)
+                    // Insert call edges
+                    edges_tag = JSON.GetArray(node, "edges")
+                    IfCondition NotEqual(edges_tag, 0) ThenBlock: {
+                        edges_arr = JSON.AsArray(edges_tag)
+                        IfCondition NotEqual(edges_arr, 0) ThenBlock: {
+                            ne = JSON.ArrayLength(edges_arr)
+                            ei = 0
+                            WhileLoop LessThan(ei, ne) {
+                                edge_tag = JSON.ArrayGet(edges_arr, ei)
+                                edge_arr = JSON.AsArray(edge_tag)
+                                IfCondition NotEqual(edge_arr, 0) ThenBlock: {
+                                    callee_tag = JSON.ArrayGet(edge_arr, 0)
+                                    callee_str = JSON.AsString(callee_tag)
+                                    IfCondition NotEqual(callee_str, 0) ThenBlock: {
+                                        Rel_InsertEdge(file_id, tok, callee_str, "calls")
+                                    }
+                                }
+                                ei = Add(ei, 1)
+                            }
+                        }
+                    }
+                }
+                k = Add(k, 1)
+            }
+            Array.Destroy(node_keys)
+        }
+
+        Walker.n_new = Add(Walker.n_new, 1)
+    }
+}
+
+// Recursively descend into the directory currently at Walker.path.
+// Uses a depth-indexed slab (Walker.dent_slab) so each recursion frame gets
+// its own 8 KiB slot with zero Arena growth. Walker.depth tracks the current
+// frame index; callee increments on entry, decrements on return.
+Function.Walker_RecurseDir {
+    Input: dir_fd: Integer
+    Body: {
+        dent_buf = Add(Walker.dent_slab, Multiply(Walker.depth, CCRelConst.DENTS_BUF))
+        Walker.depth = Add(Walker.depth, 1)
+        WhileLoop 1 {
+            n = SystemCall(CCRelSys.SYS_GETDENTS, dir_fd, dent_buf, CCRelConst.DENTS_BUF)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            off = 0
+            WhileLoop LessThan(off, n) {
+                reclen_lo = GetByte(dent_buf, Add(off, 16))
+                reclen_hi = GetByte(dent_buf, Add(off, 17))
+                reclen = Add(reclen_lo, Multiply(reclen_hi, 256))
+                IfCondition LessEqual(reclen, 0) ThenBlock: { off = n }
+                IfCondition GreaterThan(reclen, 0) ThenBlock: {
+                    name_off = Add(off, CCRelConst.DENT_NAME)
+                    name_ptr = Add(dent_buf, name_off)
+
+                    // Append "/<name>" to Walker.path, remembering old length.
+                    saved_len = Walker.path_len
+                    SetByte(Walker.path, saved_len, 47)
+                    name_len = 0
+                    p = name_off
+                    WhileLoop And(LessThan(p, n), NotEqual(GetByte(dent_buf, p), 0)) {
+                        IfCondition LessThan(Add(saved_len, Add(name_len, 2)), CCRelConst.PATH_MAX) ThenBlock: {
+                            SetByte(Walker.path, Add(saved_len, Add(name_len, 1)), GetByte(dent_buf, p))
+                        }
+                        name_len = Add(name_len, 1)
+                        p = Add(p, 1)
+                    }
+                    SetByte(Walker.path, Add(saved_len, Add(name_len, 1)), 0)
+                    Walker.path_len = Add(saved_len, Add(name_len, 1))
+
+                    // Classify via stat (this kernel emits no d_type byte).
+                    // FS_Stat updates CCRelState.last_mode as a side effect.
+                    is_dir = 0
+                    is_reg = 0
+                    st_rc = FS_Stat(Walker.path)
+                    IfCondition GreaterEqual(st_rc, 0) ThenBlock: {
+                        masked = BitwiseAnd(CCRelState.last_mode, CCRelSys.S_IFMT)
+                        IfCondition EqualTo(masked, CCRelSys.S_IFDIR) ThenBlock: { is_dir = 1 }
+                        IfCondition EqualTo(masked, CCRelSys.S_IFREG) ThenBlock: { is_reg = 1 }
+                    }
+
+                    IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                        IfCondition EqualTo(Walker_ShouldSkipDir(name_ptr), 0) ThenBlock: {
+                            sub_fd = SystemCall(CCRelSys.SYS_OPEN, Walker.path, Add(CCRelSys.O_RDONLY, CCRelSys.O_DIR), 0)
+                            IfCondition GreaterEqual(sub_fd, 0) ThenBlock: {
+                                Walker_RecurseDir(sub_fd)
+                                SystemCall(CCRelSys.SYS_CLOSE, sub_fd)
+                            }
+                        }
+                    }
+                    IfCondition EqualTo(is_reg, 1) ThenBlock: {
+                        // Skip files starting with "."
+                        IfCondition NotEqual(GetByte(dent_buf, name_off), 46) ThenBlock: {
+                            rel_offset = Walker.proot_len
+                            IfCondition LessThan(rel_offset, Walker.path_len) ThenBlock: {
+                                IfCondition EqualTo(GetByte(Walker.path, rel_offset), 47) ThenBlock: {
+                                    rel_offset = Add(rel_offset, 1)
+                                }
+                            }
+                            Walker_ProcessFile(rel_offset)
+                        }
+                    }
+
+                    // Restore path
+                    Walker.path_len = saved_len
+                    SetByte(Walker.path, saved_len, 0)
+                }
+                off = Add(off, reclen)
+            }
+        }
+        Walker.depth = Subtract(Walker.depth, 1)
+    }
+}
+
+// Top-level walker entry. Initializes Walker.path with the project root,
+// opens the root dir, runs the recursion.
+Function.Walker_Walk {
+    Input: root: Address
+    Input: files_obj: Address
+    Input: exts_csv: Address
+    Body: {
+        rlen = StringLength(root)
+        IfCondition GreaterEqual(rlen, CCRelConst.PATH_MAX) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, rlen) {
+            SetByte(Walker.path, i, GetByte(root, i))
+            i = Add(i, 1)
+        }
+        SetByte(Walker.path, rlen, 0)
+        Walker.path_len = rlen
+        Walker.proot_len = rlen
+        Walker.files_obj = files_obj
+        Walker.exts_csv  = exts_csv
+        Walker.n_new = 0
+        Walker.n_updated = 0
+        Walker.n_skipped = 0
+        Walker.n_failed = 0
+        Walker.n_total = 0
+
+        fd = SystemCall(CCRelSys.SYS_OPEN, Walker.path, Add(CCRelSys.O_RDONLY, CCRelSys.O_DIR), 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        Walker_RecurseDir(fd)
+        SystemCall(CCRelSys.SYS_CLOSE, fd)
+    }
+}
+
+
+Function.Op_Status {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        sql = StringConcat("SELECT COUNT(*) AS n FROM hc_files WHERE project_id=", proj_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        file_cnt = 0
+        IfCondition NotEqual(rows, 0) ThenBlock: {
+            IfCondition GreaterThan(Array.Size(rows), 0) ThenBlock: {
+                row = Array.Get(rows, 0)
+                s = Hash.Get(row, "n")
+                IfCondition NotEqual(s, 0) ThenBlock: { file_cnt = StringToNumber(s) }
+            }
+            PG_DestroyResult(rows)
+        }
+        sql = StringConcat("SELECT COUNT(*) AS n FROM hc_symbols s JOIN hc_files f ON s.file_id=f.id WHERE f.project_id=", proj_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        sym_cnt = 0
+        IfCondition NotEqual(rows, 0) ThenBlock: {
+            IfCondition GreaterThan(Array.Size(rows), 0) ThenBlock: {
+                row = Array.Get(rows, 0)
+                s = Hash.Get(row, "n")
+                IfCondition NotEqual(s, 0) ThenBlock: { sym_cnt = StringToNumber(s) }
+            }
+            PG_DestroyResult(rows)
+        }
+        sql3 = StringConcat("SELECT COUNT(*) AS n FROM hc_symbol_edges e JOIN hc_files f ON e.file_id=f.id WHERE f.project_id=", proj_str)
+        rows3 = PG_Query(CCRelState.conn, sql3)
+        edge_cnt = 0
+        IfCondition NotEqual(rows3, 0) ThenBlock: {
+            IfCondition GreaterThan(Array.Size(rows3), 0) ThenBlock: {
+                row3 = Array.Get(rows3, 0)
+                s3 = Hash.Get(row3, "n")
+                IfCondition NotEqual(s3, 0) ThenBlock: { edge_cnt = StringToNumber(s3) }
+            }
+            PG_DestroyResult(rows3)
+        }
+        Buf_AppendInt(file_cnt)
+        Buf_AppendStr(" files, ")
+        Buf_AppendInt(sym_cnt)
+        Buf_AppendStr(" symbols, ")
+        Buf_AppendInt(edge_cnt)
+        IfCondition NotEqual(CtagsState.binary, 0) ThenBlock: {
+            Buf_AppendStr(" edges [ctags: ")
+            Buf_AppendStr(CtagsState.binary)
+            Buf_AppendStr("]\n")
+        } ElseBlock: {
+            Buf_AppendStr(" edges [ctags: not found - install universal-ctags for multi-language support]\n")
+        }
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Summary {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        ReturnValue(Op_Status(args, err_buf))
+    }
+}
+
+
+Function.Op_Query {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        keywords = JSON.GetString(args, "keywords")
+        IfCondition EqualTo(keywords, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'keywords' for op=query", 31)
+            SetByte(err_buf, 31, 0)
+            ReturnValue(0)
+        }
+        limit = JSON.GetNumber(args, "limit")
+        IfCondition LessEqual(limit, 0) ThenBlock: { limit = CCRelConst.DEFAULT_QUERY_LIMIT }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_kw = Rel_EscStr(keywords)
+        limit_str = NumberToString(limit)
+        sql = StringConcat("SELECT f.rel_path, s.name, s.kind, s.line_start FROM hc_symbols s JOIN hc_files f ON s.file_id=f.id WHERE f.project_id=", proj_str)
+        sql = StringConcat(sql, " AND s.tsv @@ plainto_tsquery('english', '")
+        sql = StringConcat(sql, esc_kw)
+        sql = StringConcat(sql, "') ORDER BY ts_rank(s.tsv, plainto_tsquery('english','")
+        sql = StringConcat(sql, esc_kw)
+        sql = StringConcat(sql, "')) DESC LIMIT ")
+        sql = StringConcat(sql, limit_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            Buf_AppendStr("[query error]\n")
+            ReturnValue(Buf_Content())
+        }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(rows)
+            Buf_AppendStr("[no results for: ")
+            Buf_AppendStr(keywords)
+            Buf_AppendStr("]\n")
+            ReturnValue(Buf_Content())
+        }
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            row = Array.Get(rows, i)
+            rp = Hash.Get(row, "rel_path")
+            sn = Hash.Get(row, "name")
+            sk = Hash.Get(row, "kind")
+            sl = Hash.Get(row, "line_start")
+            IfCondition NotEqual(rp, 0) ThenBlock: { Buf_AppendStr(rp) }
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(sk, 0) ThenBlock: { Buf_AppendStr(sk) }
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(sn, 0) ThenBlock: { Buf_AppendStr(sn) }
+            IfCondition NotEqual(sl, 0) ThenBlock: { Buf_AppendStr("  :") Buf_AppendStr(sl) }
+            Buf_AppendNL()
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(Buf_Content())
+    }
+}
+
+// Scan state still needed by Where_AppendHit for display formatting.
+FixedPool.Scan {
+    "needle":     Initialize=0, CanChange=True
+    "want_exact": Initialize=0, CanChange=True
+    "limit":      Initialize=0, CanChange=True
+    "emitted":    Initialize=0, CanChange=True
+    "proj_base":  Initialize=0, CanChange=True
+    "rel":        Initialize=0, CanChange=True
+}
+
+
+Function.Op_Where {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition EqualTo(symbol, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'symbol' arg for op=where", 33)
+            SetByte(err_buf, 33, 0)
+            ReturnValue(0)
+        }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_sym = Rel_EscStr(symbol)
+        // Exact match first
+        sql = StringConcat("SELECT f.rel_path, s.name, s.kind, s.line_start FROM hc_symbols s JOIN hc_files f ON s.file_id=f.id WHERE f.project_id=", proj_str)
+        sql = StringConcat(sql, " AND lower(s.name)=lower('")
+        sql = StringConcat(sql, esc_sym)
+        sql = StringConcat(sql, "') ORDER BY f.rel_path, s.line_start LIMIT 20")
+        rows = PG_Query(CCRelState.conn, sql)
+        exact_cnt = 0
+        IfCondition NotEqual(rows, 0) ThenBlock: {
+            exact_cnt = Array.Size(rows)
+        }
+        IfCondition GreaterThan(exact_cnt, 0) ThenBlock: {
+            Buf_AppendStr("[exact]\n")
+            i = 0
+            WhileLoop LessThan(i, exact_cnt) {
+                row = Array.Get(rows, i)
+                rp   = Hash.Get(row, "rel_path")
+                sn   = Hash.Get(row, "name")
+                sk   = Hash.Get(row, "kind")
+                sl   = Hash.Get(row, "line_start")
+                Buf_AppendStr("  ")
+                IfCondition NotEqual(rp, 0) ThenBlock: { Buf_AppendStr(rp) }
+                Buf_AppendStr("  ")
+                IfCondition NotEqual(sk, 0) ThenBlock: { Buf_AppendStr(sk) }
+                Buf_AppendStr("  ")
+                IfCondition NotEqual(sn, 0) ThenBlock: { Buf_AppendStr(sn) }
+                IfCondition NotEqual(sl, 0) ThenBlock: { Buf_AppendStr("  :") Buf_AppendStr(sl) }
+                Buf_AppendNL()
+                i = Add(i, 1)
+            }
+            PG_DestroyResult(rows)
+        }
+        // Partial match (ILIKE) — skip if already have exact hits
+        IfCondition EqualTo(exact_cnt, 0) ThenBlock: {
+            IfCondition NotEqual(rows, 0) ThenBlock: { PG_DestroyResult(rows) }
+            sql = StringConcat("SELECT f.rel_path, s.name, s.kind, s.line_start FROM hc_symbols s JOIN hc_files f ON s.file_id=f.id WHERE f.project_id=", proj_str)
+            sql = StringConcat(sql, " AND lower(s.name) LIKE lower('%")
+            sql = StringConcat(sql, esc_sym)
+            sql = StringConcat(sql, "%') ORDER BY f.rel_path, s.line_start LIMIT 20")
+            rows = PG_Query(CCRelState.conn, sql)
+            part_cnt = 0
+            IfCondition NotEqual(rows, 0) ThenBlock: { part_cnt = Array.Size(rows) }
+            IfCondition GreaterThan(part_cnt, 0) ThenBlock: {
+                Buf_AppendStr("[partial]\n")
+                i = 0
+                WhileLoop LessThan(i, part_cnt) {
+                    row = Array.Get(rows, i)
+                    rp = Hash.Get(row, "rel_path")
+                    sn = Hash.Get(row, "name")
+                    sk = Hash.Get(row, "kind")
+                    sl = Hash.Get(row, "line_start")
+                    Buf_AppendStr("  ")
+                    IfCondition NotEqual(rp, 0) ThenBlock: { Buf_AppendStr(rp) }
+                    Buf_AppendStr("  ")
+                    IfCondition NotEqual(sk, 0) ThenBlock: { Buf_AppendStr(sk) }
+                    Buf_AppendStr("  ")
+                    IfCondition NotEqual(sn, 0) ThenBlock: { Buf_AppendStr(sn) }
+                    IfCondition NotEqual(sl, 0) ThenBlock: { Buf_AppendStr("  :") Buf_AppendStr(sl) }
+                    Buf_AppendNL()
+                    i = Add(i, 1)
+                }
+            } ElseBlock: {
+                Buf_AppendStr("[no hits for ")
+                Buf_AppendStr(symbol)
+                Buf_AppendStr("]\n")
+            }
+            IfCondition NotEqual(rows, 0) ThenBlock: { PG_DestroyResult(rows) }
+        }
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Symbols {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path = JSON.GetString(args, "path")
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'path' arg for op=symbols", 33)
+            SetByte(err_buf, 33, 0)
+            ReturnValue(0)
+        }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_path = Rel_EscStr(path)
+        sql = StringConcat("SELECT s.name, s.kind, s.line_start FROM hc_symbols s JOIN hc_files f ON s.file_id=f.id WHERE f.project_id=", proj_str)
+        sql = StringConcat(sql, " AND (f.path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR f.rel_path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR f.path LIKE '%")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "') ORDER BY s.line_start")
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            Buf_AppendStr("[query error]\n")
+            ReturnValue(Buf_Content())
+        }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(rows)
+            Buf_AppendStr("[file not indexed: ")
+            Buf_AppendStr(path)
+            Buf_AppendStr("]\n")
+            ReturnValue(Buf_Content())
+        }
+        Buf_AppendChar(91)
+        Buf_AppendStr(path)
+        Buf_AppendStr(": ")
+        Buf_AppendInt(cnt)
+        Buf_AppendStr(" symbols]\n")
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            row = Array.Get(rows, i)
+            sym_name = Hash.Get(row, "name")
+            sym_kind = Hash.Get(row, "kind")
+            sym_line = Hash.Get(row, "line_start")
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(sym_kind, 0) ThenBlock: { Buf_AppendStr(sym_kind) } ElseBlock: { Buf_AppendStr("?") }
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(sym_name, 0) ThenBlock: { Buf_AppendStr(sym_name) } ElseBlock: { Buf_AppendStr("?") }
+            IfCondition NotEqual(sym_line, 0) ThenBlock: {
+                Buf_AppendStr("  :")
+                Buf_AppendStr(sym_line)
+            }
+            Buf_AppendNL()
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(Buf_Content())
+    }
+}
+
+// Op_Focus: symbols in a file matching a symbol name pattern — delegate to Op_Symbols + where
+Function.Op_Focus {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        ReturnValue(Op_Symbols(args, err_buf))
+    }
+}
+
+Function.Op_Callers {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition EqualTo(symbol, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'symbol' for op=callers", 31)
+            SetByte(err_buf, 31, 0)
+            ReturnValue(0)
+        }
+        limit = JSON.GetNumber(args, "limit")
+        IfCondition LessEqual(limit, 0) ThenBlock: { limit = CCRelConst.DEFAULT_CALLER_LIMIT }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_sym = Rel_EscStr(symbol)
+        limit_str = NumberToString(limit)
+        sql = StringConcat("SELECT DISTINCT e.caller, f.rel_path FROM hc_symbol_edges e JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+        sql = StringConcat(sql, " AND lower(e.callee)=lower('")
+        sql = StringConcat(sql, esc_sym)
+        sql = StringConcat(sql, "') ORDER BY f.rel_path, e.caller LIMIT ")
+        sql = StringConcat(sql, limit_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            Buf_AppendStr("[query error]\n")
+            ReturnValue(Buf_Content())
+        }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(rows)
+            Buf_AppendStr("[no callers found for ")
+            Buf_AppendStr(symbol)
+            Buf_AppendStr("]\n")
+            ReturnValue(Buf_Content())
+        }
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            row = Array.Get(rows, i)
+            caller = Hash.Get(row, "caller")
+            rp     = Hash.Get(row, "rel_path")
+            IfCondition NotEqual(rp, 0) ThenBlock: { Buf_AppendStr(rp) }
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(caller, 0) ThenBlock: { Buf_AppendStr(caller) }
+            Buf_AppendNL()
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Calls {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition EqualTo(symbol, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'symbol' for op=calls", 29)
+            SetByte(err_buf, 29, 0)
+            ReturnValue(0)
+        }
+        limit = JSON.GetNumber(args, "limit")
+        IfCondition LessEqual(limit, 0) ThenBlock: { limit = 25 }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_sym = Rel_EscStr(symbol)
+        limit_str = NumberToString(limit)
+        sql = StringConcat("SELECT DISTINCT e.callee FROM hc_symbol_edges e WHERE e.project_id=", proj_str)
+        sql = StringConcat(sql, " AND lower(e.caller)=lower('")
+        sql = StringConcat(sql, esc_sym)
+        sql = StringConcat(sql, "') ORDER BY e.callee LIMIT ")
+        sql = StringConcat(sql, limit_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            Buf_AppendStr("[query error]\n")
+            ReturnValue(Buf_Content())
+        }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(rows)
+            Buf_AppendStr("[no calls found from ")
+            Buf_AppendStr(symbol)
+            Buf_AppendStr("]\n")
+            ReturnValue(Buf_Content())
+        }
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            row = Array.Get(rows, i)
+            callee = Hash.Get(row, "callee")
+            IfCondition NotEqual(callee, 0) ThenBlock: { Buf_AppendStr(callee) }
+            Buf_AppendNL()
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Graph {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition EqualTo(symbol, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'symbol' for op=graph", 29)
+            SetByte(err_buf, 29, 0)
+            ReturnValue(0)
+        }
+        limit = JSON.GetNumber(args, "limit")
+        IfCondition LessEqual(limit, 0) ThenBlock: { limit = 50 }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_sym = Rel_EscStr(symbol)
+        limit_str = NumberToString(limit)
+
+        // Outbound edges: symbol -> ?
+        sql = StringConcat("SELECT DISTINCT e.callee, e.kind, f.rel_path FROM hc_symbol_edges e LEFT JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+        sql = StringConcat(sql, " AND lower(e.caller)=lower('")
+        sql = StringConcat(sql, esc_sym)
+        sql = StringConcat(sql, "') ORDER BY e.kind, e.callee LIMIT ")
+        sql = StringConcat(sql, limit_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        out_cnt = 0
+        IfCondition NotEqual(rows, 0) ThenBlock: {
+            out_cnt = Array.Size(rows)
+            IfCondition GreaterThan(out_cnt, 0) ThenBlock: {
+                Buf_AppendStr(symbol)
+                Buf_AppendStr(" outbound (")
+                Buf_AppendInt(out_cnt)
+                Buf_AppendStr("):\n")
+                i = 0
+                WhileLoop LessThan(i, out_cnt) {
+                    row = Array.Get(rows, i)
+                    callee = Hash.Get(row, "callee")
+                    ekind  = Hash.Get(row, "kind")
+                    rpath  = Hash.Get(row, "rel_path")
+                    Buf_AppendStr("  ")
+                    IfCondition NotEqual(ekind, 0) ThenBlock: { Buf_AppendStr(ekind) } ElseBlock: { Buf_AppendStr("calls") }
+                    Buf_AppendStr(" -> ")
+                    IfCondition NotEqual(callee, 0) ThenBlock: { Buf_AppendStr(callee) }
+                    IfCondition NotEqual(rpath, 0) ThenBlock: { Buf_AppendStr("  (")  Buf_AppendStr(rpath)  Buf_AppendStr(")") }
+                    Buf_AppendNL()
+                    i = Add(i, 1)
+                }
+            }
+            PG_DestroyResult(rows)
+        }
+
+        // Inbound edges: ? -> symbol
+        sql2 = StringConcat("SELECT DISTINCT e.caller, e.kind, f.rel_path FROM hc_symbol_edges e LEFT JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+        sql2 = StringConcat(sql2, " AND lower(e.callee)=lower('")
+        sql2 = StringConcat(sql2, esc_sym)
+        sql2 = StringConcat(sql2, "') ORDER BY e.kind, e.caller LIMIT ")
+        sql2 = StringConcat(sql2, limit_str)
+        rows2 = PG_Query(CCRelState.conn, sql2)
+        IfCondition NotEqual(rows2, 0) ThenBlock: {
+            in_cnt = Array.Size(rows2)
+            IfCondition GreaterThan(in_cnt, 0) ThenBlock: {
+                Buf_AppendStr(symbol)
+                Buf_AppendStr(" inbound (")
+                Buf_AppendInt(in_cnt)
+                Buf_AppendStr("):\n")
+                i2 = 0
+                WhileLoop LessThan(i2, in_cnt) {
+                    row2 = Array.Get(rows2, i2)
+                    caller2 = Hash.Get(row2, "caller")
+                    ekind2  = Hash.Get(row2, "kind")
+                    rpath2  = Hash.Get(row2, "rel_path")
+                    Buf_AppendStr("  ")
+                    IfCondition NotEqual(caller2, 0) ThenBlock: { Buf_AppendStr(caller2) }
+                    Buf_AppendStr(" -")
+                    IfCondition NotEqual(ekind2, 0) ThenBlock: { Buf_AppendStr(ekind2) } ElseBlock: { Buf_AppendStr("calls") }
+                    Buf_AppendStr("-> ")
+                    Buf_AppendStr(symbol)
+                    IfCondition NotEqual(rpath2, 0) ThenBlock: { Buf_AppendStr("  (")  Buf_AppendStr(rpath2)  Buf_AppendStr(")") }
+                    Buf_AppendNL()
+                    i2 = Add(i2, 1)
+                }
+            }
+            PG_DestroyResult(rows2)
+        }
+
+        IfCondition EqualTo(RespBuf.len, 0) ThenBlock: {
+            Buf_AppendStr("[no edges found for: ")
+            Buf_AppendStr(symbol)
+            Buf_AppendStr("]\n")
+        }
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Imports {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path = JSON.GetString(args, "path")
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition And(EqualTo(path, 0), EqualTo(symbol, 0)) ThenBlock: {
+            MemoryCopy(err_buf, "op=imports requires 'path' or 'symbol'", 38)
+            SetByte(err_buf, 38, 0)
+            ReturnValue(0)
+        }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            // What does this file import?
+            esc_path = Rel_EscStr(path)
+            sql = StringConcat("SELECT DISTINCT e.callee FROM hc_symbol_edges e JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+            sql = StringConcat(sql, " AND e.kind='imports' AND (f.path='")
+            sql = StringConcat(sql, esc_path)
+            sql = StringConcat(sql, "' OR f.rel_path='")
+            sql = StringConcat(sql, esc_path)
+            sql = StringConcat(sql, "') ORDER BY e.callee LIMIT 100")
+            rows = PG_Query(CCRelState.conn, sql)
+            IfCondition NotEqual(rows, 0) ThenBlock: {
+                cnt = Array.Size(rows)
+                Buf_AppendStr(path)
+                Buf_AppendStr(" imports (")
+                Buf_AppendInt(cnt)
+                Buf_AppendStr("):\n")
+                i = 0
+                WhileLoop LessThan(i, cnt) {
+                    row = Array.Get(rows, i)
+                    callee = Hash.Get(row, "callee")
+                    IfCondition NotEqual(callee, 0) ThenBlock: { Buf_AppendStr("  ")  Buf_AppendStr(callee)  Buf_AppendNL() }
+                    i = Add(i, 1)
+                }
+                PG_DestroyResult(rows)
+            }
+        }
+
+        IfCondition NotEqual(symbol, 0) ThenBlock: {
+            // Who imports this module/symbol?
+            esc_sym2 = Rel_EscStr(symbol)
+            sql2 = StringConcat("SELECT DISTINCT f.rel_path FROM hc_symbol_edges e JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+            sql2 = StringConcat(sql2, " AND e.kind='imports' AND lower(e.callee) LIKE lower('%")
+            sql2 = StringConcat(sql2, esc_sym2)
+            sql2 = StringConcat(sql2, "%') ORDER BY f.rel_path LIMIT 50")
+            rows2 = PG_Query(CCRelState.conn, sql2)
+            IfCondition NotEqual(rows2, 0) ThenBlock: {
+                cnt2 = Array.Size(rows2)
+                Buf_AppendStr(symbol)
+                Buf_AppendStr(" imported by (")
+                Buf_AppendInt(cnt2)
+                Buf_AppendStr("):\n")
+                i2 = 0
+                WhileLoop LessThan(i2, cnt2) {
+                    row2 = Array.Get(rows2, i2)
+                    rp = Hash.Get(row2, "rel_path")
+                    IfCondition NotEqual(rp, 0) ThenBlock: { Buf_AppendStr("  ")  Buf_AppendStr(rp)  Buf_AppendNL() }
+                    i2 = Add(i2, 1)
+                }
+                PG_DestroyResult(rows2)
+            }
+        }
+
+        IfCondition EqualTo(RespBuf.len, 0) ThenBlock: { Buf_AppendStr("[no import edges found]\n") }
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Dependents {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        symbol = JSON.GetString(args, "symbol")
+        IfCondition EqualTo(symbol, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'symbol' for op=dependents", 35)
+            SetByte(err_buf, 35, 0)
+            ReturnValue(0)
+        }
+        limit = JSON.GetNumber(args, "limit")
+        IfCondition LessEqual(limit, 0) ThenBlock: { limit = 50 }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_sym = Rel_EscStr(symbol)
+        limit_str = NumberToString(limit)
+        sql = StringConcat("SELECT DISTINCT e.caller, e.kind, f.rel_path FROM hc_symbol_edges e LEFT JOIN hc_files f ON e.file_id=f.id WHERE e.project_id=", proj_str)
+        sql = StringConcat(sql, " AND lower(e.callee)=lower('")
+        sql = StringConcat(sql, esc_sym)
+        sql = StringConcat(sql, "') ORDER BY e.kind, e.caller LIMIT ")
+        sql = StringConcat(sql, limit_str)
+        rows = PG_Query(CCRelState.conn, sql)
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            Buf_AppendStr("[query error]\n")
+            ReturnValue(Buf_Content())
+        }
+        cnt = Array.Size(rows)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(rows)
+            Buf_AppendStr("[no dependents found for: ")
+            Buf_AppendStr(symbol)
+            Buf_AppendStr("]\n")
+            ReturnValue(Buf_Content())
+        }
+        Buf_AppendStr("dependents of ")
+        Buf_AppendStr(symbol)
+        Buf_AppendStr(" (")
+        Buf_AppendInt(cnt)
+        Buf_AppendStr("):\n")
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            row = Array.Get(rows, i)
+            caller = Hash.Get(row, "caller")
+            ekind  = Hash.Get(row, "kind")
+            rpath  = Hash.Get(row, "rel_path")
+            Buf_AppendStr("  ")
+            IfCondition NotEqual(caller, 0) ThenBlock: { Buf_AppendStr(caller) }
+            Buf_AppendStr(" via ")
+            IfCondition NotEqual(ekind, 0) ThenBlock: { Buf_AppendStr(ekind) } ElseBlock: { Buf_AppendStr("calls") }
+            IfCondition NotEqual(rpath, 0) ThenBlock: { Buf_AppendStr("  (")  Buf_AppendStr(rpath)  Buf_AppendStr(")") }
+            Buf_AppendNL()
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(rows)
+        ReturnValue(Buf_Content())
+    }
+}
+
+// Build the comma-wrapped extension allowlist from a user csv arg
+// (e.g. "ailang,py,sh,md") into ",ailang,py,sh,md," form for substring
+// matching. Stored in OpScratch.tmp (caller consumes immediately).
+Function.Index_BuildExtCSV {
+    Input: user_csv: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(user_csv, 0) ThenBlock: {
+            user_csv = "ailang,py,sh,md,c,zig,html,json"
+        }
+        ulen = StringLength(user_csv)
+        SetByte(OpScratch.tmp, 0, 44)
+        i = 0
+        out = 1
+        WhileLoop LessThan(i, ulen) {
+            ch = GetByte(user_csv, i)
+            IfCondition NotEqual(ch, 32) ThenBlock: {
+                IfCondition NotEqual(ch, 46) ThenBlock: {
+                    IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ch = Add(ch, 32) }
+                    IfCondition LessThan(out, Subtract(OpScratch.cap, 2)) ThenBlock: {
+                        SetByte(OpScratch.tmp, out, ch)
+                        out = Add(out, 1)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition GreaterThan(out, 1) ThenBlock: {
+            IfCondition NotEqual(GetByte(OpScratch.tmp, Subtract(out, 1)), 44) ThenBlock: {
+                SetByte(OpScratch.tmp, out, 44)
+                out = Add(out, 1)
+            }
+        }
+        SetByte(OpScratch.tmp, out, 0)
+        ReturnValue(OpScratch.tmp)
+    }
+}
+
+Function.Op_Index {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path = JSON.GetString(args, "path")
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'path' for op=index", 27)
+            SetByte(err_buf, 27, 0)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(FS_Exists(path), 0) ThenBlock: {
+            n = StringLength(path)
+            IfCondition GreaterThan(n, 200) ThenBlock: { n = 200 }
+            MemoryCopy(err_buf, "path does not exist: ", 21)
+            MemoryCopy(Add(err_buf, 21), path, n)
+            SetByte(err_buf, Add(21, n), 0)
+            ReturnValue(0)
+        }
+        blocked = 0
+        IfCondition EqualTo(StringCompare(path, "/"), 0)         ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(StringCompare(path, "/mnt"), 0)      ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(StringCompare(path, "/home"), 0)     ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(StringStartsWith(path, "/mnt/c"), 1) ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(blocked, 1) ThenBlock: {
+            n = StringLength(path)
+            IfCondition GreaterThan(n, 200) ThenBlock: { n = 200 }
+            MemoryCopy(err_buf, "op=index refused: path would cause unbounded walk: ", 50)
+            MemoryCopy(Add(err_buf, 50), path, n)
+            SetByte(err_buf, Add(50, n), 0)
+            ReturnValue(0)
+        }
+        Buf_Reset()
+        path_dup = Str_Dup(path)
+        user_exts = JSON.GetString(args, "exts")
+        ext_csv = Str_Dup(Index_BuildExtCSV(user_exts))
+        Walker_Walk(path_dup, 0, ext_csv)
+        bn = Path_Basename(path_dup)
+        Buf_AppendChar(91)
+        Buf_AppendStr(bn)
+        Buf_AppendStr("] ")
+        Buf_AppendInt(Walker.n_new)
+        Buf_AppendStr(" new, ")
+        Buf_AppendInt(Walker.n_updated)
+        Buf_AppendStr(" updated, ")
+        Buf_AppendInt(Walker.n_skipped)
+        Buf_AppendStr(" unchanged, ")
+        Buf_AppendInt(Walker.n_failed)
+        Buf_AppendStr(" failed\n")
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Forget {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path = JSON.GetString(args, "path")
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing 'path' for op=forget", 28)
+            SetByte(err_buf, 28, 0)
+            ReturnValue(0)
+        }
+        Buf_Reset()
+        proj_str = NumberToString(CCRelState.project_id)
+        esc_path = Rel_EscStr(path)
+        // Remove edges + symbols first (FK: hc_symbols -> hc_files).
+        sql = StringConcat("DELETE FROM hc_symbol_edges WHERE file_id IN (SELECT id FROM hc_files WHERE project_id=", proj_str)
+        sql = StringConcat(sql, " AND (path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR rel_path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR path LIKE '%")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "'))")
+        PG_Query(CCRelState.conn, sql)
+        sql = StringConcat("DELETE FROM hc_symbols WHERE file_id IN (SELECT id FROM hc_files WHERE project_id=", proj_str)
+        sql = StringConcat(sql, " AND (path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR rel_path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR path LIKE '%")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "'))")
+        PG_Query(CCRelState.conn, sql)
+        sql = StringConcat("DELETE FROM hc_files WHERE project_id=", proj_str)
+        sql = StringConcat(sql, " AND (path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR rel_path='")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "' OR path LIKE '%")
+        sql = StringConcat(sql, esc_path)
+        sql = StringConcat(sql, "')")
+        PG_Query(CCRelState.conn, sql)
+        Buf_AppendStr("forgot ")
+        Buf_AppendStr(path)
+        Buf_AppendNL()
+        ReturnValue(Buf_Content())
+    }
+}
+
+Function.Op_Drop {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        Buf_Reset()
+        Rel_DropProject()
+        Buf_AppendStr("dropped all indexed files for project\n")
+        ReturnValue(Buf_Content())
+    }
+}
+
+
+// =============================================================================
+// IPC ENVELOPE
+// =============================================================================
+Function.CCRelmem_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCRelmem_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        // Cap content at MAX_OUTPUT so the IPC message stays within the socket
+        // sanity limit regardless of how large the index response grows.
+        IfCondition NotEqual(content, 0) ThenBlock: {
+            clen = StringLength(content)
+            IfCondition GreaterThan(clen, CCRelConst.MAX_OUTPUT) ThenBlock: {
+                SetByte(content, CCRelConst.MAX_OUTPUT, 0)
+            }
+        }
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCRelmem_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCRelState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+// Dispatch on `op` field of `args`. Returns content string or 0+err_buf.
+Function.CCRelmem_Dispatch {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        op = JSON.GetString(args, "op")
+        IfCondition EqualTo(op, 0) ThenBlock: {
+            MemoryCopy(err_buf, "missing required arg: op", 25)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(op, "status"), 0) ThenBlock: { ReturnValue(Op_Status(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "summary"), 0) ThenBlock: { ReturnValue(Op_Summary(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "query"), 0) ThenBlock: { ReturnValue(Op_Query(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "where"), 0) ThenBlock: { ReturnValue(Op_Where(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "symbols"), 0) ThenBlock: { ReturnValue(Op_Symbols(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "focus"), 0) ThenBlock: { ReturnValue(Op_Focus(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "callers"), 0) ThenBlock: { ReturnValue(Op_Callers(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "calls"), 0) ThenBlock: { ReturnValue(Op_Calls(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "graph"), 0) ThenBlock: { ReturnValue(Op_Graph(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "imports"), 0) ThenBlock: { ReturnValue(Op_Imports(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "dependents"), 0) ThenBlock: { ReturnValue(Op_Dependents(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "index"), 0) ThenBlock: { ReturnValue(Op_Index(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "forget"), 0) ThenBlock: { ReturnValue(Op_Forget(args, err_buf)) }
+        IfCondition EqualTo(StringCompare(op, "drop"), 0) ThenBlock: { ReturnValue(Op_Drop(args, err_buf)) }
+
+        msg = StringConcat("unknown op: ", op)
+        n = StringLength(msg)
+        IfCondition GreaterThan(n, 250) ThenBlock: { n = 250 }
+        MemoryCopy(err_buf, msg, n)
+        SetByte(err_buf, n, 0)
+        Deallocate(msg, Add(StringLength(msg), 1))
+        ReturnValue(0)
+    }
+}
+
+Function.CCRelmem_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCRelmem_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCRelmem_SendError(client_fd, 0, "request must be a JSON object")  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCRelmem_SendError(client_fd, 0, "missing method")  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCRelmem_SendSchema(client_fd)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCRelState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCRelmem_SendError(client_fd, id, "missing required argument 'op'")  ReturnValue(0)
+            }
+            err_buf = Allocate(256)
+            SetByte(err_buf, 0, 0)
+            content = CCRelmem_Dispatch(validated, err_buf)
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                CCRelmem_SendError(client_fd, id, err_buf)
+            } ElseBlock: {
+                CCRelmem_SendResult(client_fd, id, content)
+                // content is the RespBuf mailbox — DO NOT deallocate.
+            }
+            Deallocate(err_buf, 256)
+            ReturnValue(0)
+        }
+        CCRelmem_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+    CCRelConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    // FS_Exists stats into this buffer. Allocate it before Ctags_FindBinary,
+    // or stat(path, NULL) fails and ctags is reported as not installed.
+    CCRelState.stat_buf = Allocate(CCRelConst.STATBUF_SIZE)
+    Ctags_FindBinary()
+    CCRelConst.SOCK_PATH = "@halcode/Relmem"
+    CCRelState.schema = CCRelmem_BuildSchema()
+
+    // Allocate path scratch mailboxes once; Path_* helpers reuse them.
+    PathScratch.buf_a = Allocate(PathScratch.cap)
+    PathScratch.buf_b = Allocate(PathScratch.cap)
+    PathScratch.buf_c = Allocate(PathScratch.cap)
+    SetByte(PathScratch.buf_a, 0, 0)
+    SetByte(PathScratch.buf_b, 0, 0)
+    SetByte(PathScratch.buf_c, 0, 0)
+
+    // Response content mailbox — single buffer, reused per request.
+    RespBuf.buf = Allocate(RespBuf.cap)
+    RespBuf.len = 0
+    SetByte(RespBuf.buf, 0, 0)
+
+    OpScratch.needle = Allocate(OpScratch.cap)
+    OpScratch.tok_lc = Allocate(OpScratch.cap)
+    OpScratch.tmp    = Allocate(OpScratch.cap)
+    SetByte(OpScratch.needle, 0, 0)
+    SetByte(OpScratch.tok_lc, 0, 0)
+    SetByte(OpScratch.tmp, 0, 0)
+
+    Walker.path      = Allocate(CCRelConst.PATH_MAX)
+    Walker.join_buf  = Allocate(CCRelConst.PATH_MAX)
+    Walker.dent_slab = Allocate(Multiply(CCRelConst.WALK_MAX_DEPTH, CCRelConst.DENTS_BUF))
+    Walker.depth     = 0
+    SetByte(Walker.path, 0, 0)
+    SetByte(Walker.join_buf, 0, 0)
+
+    // Pre-allocate "h1".."h6" strings — 6 slots × 3 bytes each.
+    HeadingCats.slab = Allocate(18)
+    _hci = 0
+    WhileLoop LessThan(_hci, 6) {
+        _hs = Add(HeadingCats.slab, Multiply(_hci, 3))
+        SetByte(_hs, 0, 104)
+        SetByte(_hs, 1, Add(49, _hci))
+        SetByte(_hs, 2, 0)
+        _hci = Add(_hci, 1)
+    }
+
+    Builtins_Init()
+
+    // Allocate SQL escape buffer
+    CCRelState.esc_buf = Allocate(CCRelConst.ESC_BUF)
+
+    // Connect to postgres — read $USER from env, no hardcoded names
+    _pg_user = Env_LoadVar("USER")
+    IfCondition EqualTo(_pg_user, 0) ThenBlock: { _pg_user = "nobody" }
+    conn = PG_ConnectUnix("/var/run/postgresql", 5432, "ailang_system", _pg_user, "")
+    IfCondition EqualTo(conn, 0) ThenBlock: {
+        PrintMessage("[cc_relmem_ipc] ERROR: postgres connect failed\n")
+        SystemCall(CCRelSys.SYS_EXIT, 1)
+    }
+    CCRelState.conn = conn
+    Rel_Migrate()
+    CCRelState.project_id = Rel_GetOrCreateProject("HalCode9000")
+    IfCondition EqualTo(CCRelState.project_id, 0) ThenBlock: {
+        PrintMessage("[cc_relmem_ipc] ERROR: could not get/create project in postgres\n")
+        SystemCall(CCRelSys.SYS_EXIT, 1)
+    }
+    PrintMessage("[cc_relmem_ipc] postgres connected, project_id=")
+    PrintNumber(CCRelState.project_id)
+    PrintMessage("\n")
+
+    SystemCall(CCRelSys.SYS_MKDIR, CCRelConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCRelSys.SYS_UNLINK, CCRelConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_relmem_ipc] socket() failed\n")
+        SystemCall(CCRelSys.SYS_EXIT, 1)
+    }
+    Socket.BindUnix(fd, CCRelConst.SOCK_PATH)
+    Socket.Listen(fd, CCRelConst.BACKLOG)
+    CCRelState.listen_fd = fd
+
+    // Set SO_RCVTIMEO on listen socket so Accept() returns -1 every 10s.
+    // Lets us check idle time and exit when no requests for 30s.
+    tv_buf = Allocate(16)
+    StoreValue(tv_buf, 10)               // tv_sec = 10
+    StoreValue(Add(tv_buf, 8), 0)        // tv_usec = 0
+    SystemCall(54, fd, 1, 20, tv_buf, 16)  // setsockopt(SOL_SOCKET=1, SO_RCVTIMEO=20)
+
+    PrintMessage("[cc_relmem_ipc] listening on ")
+    PrintMessage(CCRelConst.SOCK_PATH)
+    PrintMessage("\n")
+
+    last_served = SystemCall(201, 0, 0, 0, 0, 0)
+
+    WhileLoop EqualTo(CCRelState.running, 1) {
+        client_fd = Socket.Accept(CCRelState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            pfd  = Allocate(16)
+            WhileLoop EqualTo(done, 0) {
+                StoreValue(pfd, client_fd, "dword")
+                SetByte(pfd, 4, 1)
+                SetByte(pfd, 5, 0)
+                SetByte(pfd, 6, 0)
+                SetByte(pfd, 7, 0)
+                StoreValue(Add(pfd, 8), CCRelState.listen_fd, "dword")
+                SetByte(pfd, 12, 1)
+                SetByte(pfd, 13, 0)
+                SetByte(pfd, 14, 0)
+                SetByte(pfd, 15, 0)
+
+                SystemCall(CCRelSys.SYS_POLL, pfd, 2, -1, 0, 0)
+
+                rev_client = GetByte(pfd, 6)
+                rev_listen = GetByte(pfd, 14)
+
+                IfCondition NotEqual(rev_listen, 0) ThenBlock: {
+                    new_fd = Socket.Accept(CCRelState.listen_fd)
+                    IfCondition GreaterEqual(new_fd, 0) ThenBlock: {
+                        Socket.SetRecvTimeout(new_fd, 10000)
+                        mcp_req = Socket.RecvMsg(new_fd)
+                        IfCondition NotEqual(mcp_req, 0) ThenBlock: {
+                            IfCondition NotEqual(mcp_req, -1) ThenBlock: {
+                                CCRelmem_HandleRequest(new_fd, mcp_req)
+                            }
+                        }
+                        Socket.Close(new_fd)
+                    }
+                }
+
+                IfCondition NotEqual(rev_client, 0) ThenBlock: {
+                    req = Socket.RecvMsg(client_fd)
+                    IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                    IfCondition NotEqual(req, 0) ThenBlock: {
+                        IfCondition NotEqual(req, -1) ThenBlock: {
+                            CCRelmem_HandleRequest(client_fd, req)
+                        }
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+            last_served = SystemCall(201, 0, 0, 0, 0, 0)
+        } ElseBlock: {
+            now = SystemCall(201, 0, 0, 0, 0, 0)
+            IfCondition GreaterEqual(Subtract(now, last_served), 30) ThenBlock: {
+                CCRelState.running = 0
+            }
+        }
+    }
+    SystemCall(CCRelSys.SYS_EXIT, 0)
+}
+
+RunTask(Main)

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HalBot</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14120e;
+    --panel: #1e1b16;
+    --line: #3a342c;
+    --text: #f3efe6;
+    --muted: #a39888;
+    --accent: #e2b15a;
+    --user: #2a3330;
+    --bot: #262119;
+    --bad: #e07a68;
+    --ok: #8fbf8a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 16px/1.45 "Iowan Old Style", Palatino, Georgia, serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+  header .status { color: var(--muted); font: 13px/1.2 ui-sans-serif, system-ui, sans-serif; }
+  header .status.ok { color: var(--ok); }
+  header .status.bad { color: var(--bad); }
+  header .spacer { flex: 1; }
+  label { font: 12px/1 ui-sans-serif, system-ui, sans-serif; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+  select, input, button, textarea {
+    font: 14px/1.3 ui-sans-serif, system-ui, sans-serif;
+    color: var(--text);
+    background: #2a261f;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 10px;
+  }
+  button { cursor: pointer; background: #3a3226; }
+  button.primary { background: var(--accent); color: #231c10; border-color: transparent; font-weight: 650; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log {
+    flex: 1;
+    overflow: auto;
+    padding: 22px 8vw 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .msg { max-width: 720px; padding: 12px 14px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.bot { align-self: flex-start; background: var(--bot); border: 1px solid var(--line); }
+  .msg.pending { color: var(--muted); font-style: italic; }
+  .empty { color: var(--muted); max-width: 640px; }
+  form.composer {
+    display: flex;
+    gap: 8px;
+    padding: 12px 18px 16px;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+  }
+  textarea { flex: 1; resize: none; min-height: 46px; max-height: 160px; }
+  #settings {
+    display: none;
+    padding: 10px 18px 14px;
+    border-bottom: 1px solid var(--line);
+    background: #191712;
+    gap: 12px;
+    align-items: end;
+  }
+  #settings.open { display: flex; flex-direction: column; align-items: stretch; }
+  #settings p { margin: 0; color: var(--muted); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
+  #settings label { max-width: 520px; }
+  #settings input { width: 100%; }
+  #settings input::placeholder { color: #7d7366; }
+  #settings .row { display: flex; gap: 8px; align-items: center; }
+  #settings .hint { font: 12px/1.3 ui-sans-serif, system-ui, sans-serif; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>HalBot</h1>
+  <div id="status" class="status">checking the bot…</div>
+  <div class="spacer"></div>
+  <label>Provider
+    <select id="provider"></select>
+  </label>
+  <label>Model
+    <select id="model"></select>
+  </label>
+  <button type="button" id="newchat">New chat</button>
+  <button type="button" id="settings-btn">Keys</button>
+</header>
+<div id="settings">
+  <p>Paste a provider key and save it. The key is written on the bot and is not kept in this browser. Leave a box blank to keep the key already there. This window signs in to the bot on its own.</p>
+  <label>Grok
+    <input id="key-grok" type="password" autocomplete="off" spellcheck="false" placeholder="paste an xAI key">
+    <span class="hint" id="hint-grok"></span>
+  </label>
+  <label>DeepSeek
+    <input id="key-deepseek" type="password" autocomplete="off" spellcheck="false" placeholder="paste a DeepSeek key">
+    <span class="hint" id="hint-deepseek"></span>
+  </label>
+  <label>Anthropic
+    <input id="key-anthropic" type="password" autocomplete="off" spellcheck="false" placeholder="paste an Anthropic key">
+    <span class="hint" id="hint-anthropic"></span>
+  </label>
+  <div class="row">
+    <button type="button" id="save-keys">Save keys</button>
+    <span class="hint" id="key-status"></span>
+  </div>
+</div>
+<div id="log">
+  <div class="empty" id="empty">Ask HalBot to do something on its own machine. Pick the provider above. The reply comes back when the turn finishes.</div>
+</div>
+<form class="composer" id="composer">
+  <textarea id="input" rows="2" placeholder="Message HalBot" autofocus></textarea>
+  <button class="primary" id="send" type="submit">Send</button>
+</form>
+<script>
+const PROVIDERS = [
+  { id: "grok", label: "Grok", models: ["grok-4.7", "grok-4.6", "grok-4.5", "grok-4.3"] },
+  { id: "deepseek", label: "DeepSeek", models: ["deepseek-v4-pro", "deepseek-flash"] },
+  { id: "anthropic", label: "Anthropic", models: ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-sonnet-4-6"] }
+];
+
+const providerEl = document.querySelector("#provider");
+const modelEl = document.querySelector("#model");
+const logEl = document.querySelector("#log");
+const emptyEl = document.querySelector("#empty");
+const inputEl = document.querySelector("#input");
+const sendEl = document.querySelector("#send");
+const statusEl = document.querySelector("#status");
+const keyStatusEl = document.querySelector("#key-status");
+const KEY_IDS = ["grok", "deepseek", "anthropic"];
+
+let sessionId = sessionStorage.getItem("halbot.session") || "";
+let busy = false;
+
+function fillProviders() {
+  const saved = localStorage.getItem("halbot.provider") || "grok";
+  for (const p of PROVIDERS) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.label;
+    providerEl.append(opt);
+  }
+  providerEl.value = PROVIDERS.some(p => p.id === saved) ? saved : "grok";
+  fillModels();
+  const savedModel = localStorage.getItem("halbot.model");
+  if (savedModel && [...modelEl.options].some(o => o.value === savedModel)) modelEl.value = savedModel;
+}
+
+function fillModels() {
+  const p = PROVIDERS.find(x => x.id === providerEl.value) || PROVIDERS[0];
+  const current = modelEl.value;
+  modelEl.innerHTML = "";
+  for (const id of p.models) {
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = id;
+    modelEl.append(opt);
+  }
+  if (p.models.includes(current)) modelEl.value = current;
+}
+
+function addMsg(role, text, pending) {
+  emptyEl.style.display = "none";
+  const div = document.createElement("div");
+  div.className = "msg " + role + (pending ? " pending" : "");
+  div.textContent = text;
+  logEl.append(div);
+  logEl.scrollTop = logEl.scrollHeight;
+  return div;
+}
+
+function setStatus(text, kind) {
+  statusEl.textContent = text;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+async function checkHealth() {
+  try {
+    const res = await fetch("/healthz");
+    if (!res.ok) throw new Error("offline");
+    const body = await res.json();
+    if (body.ok) setStatus("bot online", "ok");
+    else setStatus("bot offline", "bad");
+  } catch (e) {
+    setStatus("bot offline — start HalCode --serve in the guest", "bad");
+  }
+}
+
+function parseSSE(chunk, state) {
+  state.buf += chunk;
+  const events = [];
+  let idx;
+  while ((idx = state.buf.indexOf("\n\n")) >= 0) {
+    const block = state.buf.slice(0, idx);
+    state.buf = state.buf.slice(idx + 2);
+    let event = "message";
+    let data = "";
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      else if (line.startsWith("data:")) data += line.slice(5).trim();
+    }
+    if (!data) continue;
+    try { events.push({ event, data: JSON.parse(data) }); }
+    catch (e) { events.push({ event, data: { text: data } }); }
+  }
+  return events;
+}
+
+async function loadKeyStatus() {
+  try {
+    const res = await fetch("/local/keys");
+    const body = await res.json();
+    for (const id of KEY_IDS) {
+      const hint = document.querySelector("#hint-" + id);
+      if (!res.ok) hint.textContent = "Could not check the bot.";
+      else if (body[id]) hint.textContent = "A key is already on the bot.";
+      else hint.textContent = "No key on the bot yet.";
+    }
+  } catch (e) {
+    for (const id of KEY_IDS) {
+      document.querySelector("#hint-" + id).textContent = "Could not check the bot.";
+    }
+  }
+}
+
+async function sendMessage(text) {
+  const headers = { "Content-Type": "application/json" };
+  const body = JSON.stringify({
+    message: text,
+    provider: providerEl.value,
+    model: modelEl.value
+  });
+  const path = sessionId ? "/v1/sessions/" + encodeURIComponent(sessionId) + "/messages" : "/v1/chat";
+  const res = await fetch(path, { method: "POST", headers, body });
+  const ctype = res.headers.get("content-type") || "";
+  if (!res.ok || !ctype.includes("text/event-stream")) {
+    let detail = res.status + " " + res.statusText;
+    try {
+      const err = await res.json();
+      if (err.error) detail = err.error;
+    } catch (e) {}
+    throw new Error(detail);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  const state = { buf: "" };
+  let reply = "";
+  while (true) {
+    const step = await reader.read();
+    if (step.done) break;
+    for (const ev of parseSSE(dec.decode(step.value, { stream: true }), state)) {
+      if (ev.event === "session" && ev.data.session_id) {
+        sessionId = ev.data.session_id;
+        sessionStorage.setItem("halbot.session", sessionId);
+      }
+      if (ev.event === "text_delta" && ev.data.text) reply += ev.data.text;
+    }
+  }
+  return reply;
+}
+
+providerEl.addEventListener("change", () => {
+  localStorage.setItem("halbot.provider", providerEl.value);
+  fillModels();
+  localStorage.setItem("halbot.model", modelEl.value);
+});
+modelEl.addEventListener("change", () => localStorage.setItem("halbot.model", modelEl.value));
+
+document.querySelector("#settings-btn").addEventListener("click", () => {
+  const panel = document.querySelector("#settings");
+  panel.classList.toggle("open");
+  if (panel.classList.contains("open")) loadKeyStatus();
+});
+document.querySelector("#save-keys").addEventListener("click", async () => {
+  const payload = {};
+  for (const id of KEY_IDS) {
+    const value = document.querySelector("#key-" + id).value.trim();
+    if (value) payload[id] = value;
+  }
+  if (!Object.keys(payload).length) {
+    keyStatusEl.textContent = "Paste a key first. Blank boxes keep the saved key.";
+    return;
+  }
+  keyStatusEl.textContent = "Saving…";
+  try {
+    const res = await fetch("/local/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    for (const id of KEY_IDS) document.querySelector("#key-" + id).value = "";
+    document.querySelector("#settings").classList.remove("open");
+  } catch (err) {
+    keyStatusEl.textContent = err.message;
+  }
+});
+document.querySelector("#newchat").addEventListener("click", () => {
+  sessionId = "";
+  sessionStorage.removeItem("halbot.session");
+  logEl.querySelectorAll(".msg").forEach(n => n.remove());
+  emptyEl.style.display = "";
+});
+
+document.querySelector("#composer").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = inputEl.value.trim();
+  if (!text || busy) return;
+  busy = true;
+  sendEl.disabled = true;
+  inputEl.value = "";
+  addMsg("user", text);
+  const pending = addMsg("bot", "Working on the bot’s machine…", true);
+  try {
+    const reply = await sendMessage(text);
+    pending.classList.remove("pending");
+    pending.textContent = reply || "(no text came back)";
+  } catch (err) {
+    pending.classList.remove("pending");
+    pending.textContent = "HalBot did not answer: " + err.message;
+  }
+  busy = false;
+  sendEl.disabled = false;
+  inputEl.focus();
+});
+
+inputEl.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault();
+    document.querySelector("#composer").requestSubmit();
+  }
+});
+
+fillProviders();
+checkHealth();
+</script>
+</body>
+</html>
