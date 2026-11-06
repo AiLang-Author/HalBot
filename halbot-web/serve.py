@@ -55,6 +55,24 @@ def _ssh(remote_code, stdin_bytes=None, timeout=15):
     return proc
 
 
+def guest_activity():
+    path = os.path.join(ROOT, "guest_activity.py")
+    try:
+        script = open(path, encoding="utf-8").read()
+    except OSError as exc:
+        raise OSError("activity script missing") from exc
+    proc = _ssh(script, timeout=8)
+    if proc.returncode != 0:
+        raise OSError("guest activity failed")
+    try:
+        data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+    except json.JSONDecodeError as exc:
+        raise OSError("guest activity was not JSON") from exc
+    if not isinstance(data, dict):
+        raise OSError("guest activity was not an object")
+    return data
+
+
 def guest_token():
     if _TOKEN["value"]:
         return _TOKEN["value"]
@@ -179,6 +197,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/local/keys":
             self._key_status()
             return
+        if path == "/local/activity":
+            self._activity()
+            return
         if path == "/healthz" or path.startswith("/v1/"):
             self._proxy(timeout=5)
             return
@@ -209,6 +230,12 @@ class Handler(BaseHTTPRequestHandler):
     def _key_status(self):
         try:
             self._json(200, key_status())
+        except (OSError, subprocess.TimeoutExpired):
+            self._json(502, {"ok": False, "error": "could not read the bot"})
+
+    def _activity(self):
+        try:
+            self._json(200, guest_activity())
         except (OSError, subprocess.TimeoutExpired):
             self._json(502, {"ok": False, "error": "could not read the bot"})
 
